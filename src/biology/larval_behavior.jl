@@ -1,0 +1,2323 @@
+"""
+    larval_behavior.jl
+
+Snow crab (*Chionoecetes opilio*) larval behavior, Diel Vertical Migration (DVM),
+thermal degree-day ontogenetic molting, tidal current superposition, and
+benthic nursery settlement suitability filtering.
+"""
+
+using Random
+
+# ==============================================================================
+# Stochastic dispersion helpers
+#
+# Every `cv_*` knob below controls **dispersion only**. The population mean is
+# held at the configured base value, so switching a coefficient on never quietly
+# changes the expected rate. Each helper is exactly identity at `cv == 0`, which
+# is what makes the deterministic path bit-for-bit reproducible.
+# ==============================================================================
+
+"""
+    lognormal_sigma(cv::Real) -> Float64
+
+Convert a coefficient of variation into the log-scale standard deviation of a
+lognormal, `σ = sqrt(log(1 + cv²))`.
+
+A lognormal is used rather than a Normal because all the quantities being
+dispersed here — developmental rates, mortality rates — are strictly positive and
+right-skewed, which is how biological rates actually behave. A Normal must be
+clamped at zero, and the clamp is not a harmless detail: it piles a point mass on
+the boundary. Measured on the molt threshold at 200 000 draws, `cv = 0.5` put
+**2.4 %** of larvae at exactly the 1.0 degree-day floor and `cv = 0.75` put
+**9.5 %** there, i.e. cohorts of larvae that molt instantaneously. A lognormal is
+positive by construction, so there is nothing to clamp and no such artifact.
+"""
+@inline function lognormal_sigma(cv::Real)
+    c = abs(Float64(cv))
+    return c > 0 ? sqrt(log1p(c * c)) : 0.0
+end
+
+"""
+    draw_lognormal_mean(base::Real, cv::Real, rng) -> Float64
+
+Draw a positive, right-skewed value with population mean `base` and coefficient
+of variation `cv`.
+
+Parameterisation is mean-preserving: `σ = sqrt(log(1 + cv²))` and the draw is
+`base * exp(σ·z − σ²/2)` with `z ~ Normal(0,1)`, so `E[draw] = base` and
+`CV[draw] = cv` exactly. The `−σ²/2` term is what shifts the lognormal's median
+below its mean; omitting it would make the mean `base·exp(σ²/2)`, i.e. turning a
+`cv` up would also raise the expected rate.
+
+At `cv == 0` the result is exactly `base`.
+"""
+@inline function draw_lognormal_mean(base::Real, cv::Real, rng::AbstractRNG)
+    b = Float64(base)
+    σ = lognormal_sigma(cv)
+    σ > 0 || return b
+    return b * exp(σ * randn(rng) - 0.5 * σ * σ)
+end
+
+"""
+    draw_beta_index(base::Real, cv::Real, rng; min_concentration = 0.05) -> Float64
+
+Draw a value in `(0, 1)` representing a **bounded suitability index**, with population mean `base`
+and coefficient of variation `cv`.
+
+A suitability index is a probability-like quantity confined to `[0, 1]`, so neither dispersion used
+elsewhere in this file applies to it:
+
+* a **lognormal** has the wrong support — it is unbounded above, and a suitability index above 1 is
+  not a slightly optimistic index, it is an invalid one;
+* a **clipped Normal** is not mean preserving. At the optimum (`base = 1`) roughly half the mass
+  falls above 1 and is clipped to exactly 1 while the rest is clipped down, so the *expected*
+  acceptance is pushed below `base`. Turning `cv_settlement` up would then silently **reduce**
+  settlement — a dispersion knob changing the mean.
+
+A **Beta** is the standard choice for a bounded index with a controllable mean and dispersion, and
+it is the only one of the three that hits the requested mean *and* CV exactly. For
+`Beta(α, β)` with mean `μ` and concentration `κ = α + β`:
+
+    mean = μ,   var = μ(1 − μ) / (κ + 1)   ⟹   κ = (1 − μ)/(μ·cv²) − 1
+
+and the shapes follow as `α = μκ`, `β = (1 − μ)κ`.
+
+**Feasibility limit.** A variable on `[0, 1]` has `var ≤ μ(1 − μ)`, so a bounded index of mean `μ`
+cannot have a CV larger than `sqrt((1 − μ)/μ)` — 0.33 at `μ = 0.9`, 1.0 at `μ = 0.5`, 3.0 at
+`μ = 0.1`. This is a property of the interval, not a modelling choice: asking for `cv = 0.5` on an
+index of 0.9 means a substantial fraction of cases must sit at 0. `κ` is floored at
+`min_concentration` so such a request degrades to a near-Bernoulli draw instead of producing a
+negative concentration, and the mean is still preserved. Worth knowing when reading results: at a
+high `μ` the effective CV saturates below the requested one.
+
+`base` of exactly 0 or 1 is returned unchanged, so the unsuitability gate and the optimum are
+respected exactly. `cv = 0` returns `base` unchanged.
+"""
+@inline function draw_beta_index(base::Real, cv::Real, rng::AbstractRNG; min_concentration::Real = 0.05)
+    μ = Float64(base)
+    # Endpoints are hard values: 0 is the unsuitability gate, 1 is the optimum.
+    (μ <= 0.0) && return 0.0
+    (μ >= 1.0) && return 1.0
+    c = abs(Float64(cv))
+    (c > 0) || return μ
+
+    # κ = (1 − μ)/(μ·cv²) − 1, floored so α, β stay positive.
+    κ = max((1.0 - μ) / (μ * c * c) - 1.0, Float64(min_concentration))
+    α = μ * κ
+    β = (1.0 - μ) * κ
+    return clamp(rand(rng, Beta(α, β)), 0.0, 1.0)
+end
+
+"""
+    larval_ascent_velocity(
+        z::Real;
+        z_surface_target::Real = -10.0,
+        max_ascent_speed::Real = 0.010,
+        relaxation_depth::Real = 10.0
+    ) -> Float64
+
+Compute active post-hatch vertical ascent velocity \$w_{\\text{ascent}}(z)\$ for
+newly hatched snow crab larvae (*Chionoecetes opilio*) rising from benthic hatching
+grounds on the ocean floor to the epipelagic surface mixed layer.
+
+# Mathematical & Biological Formulation
+Ovigerous female snow crabs dwell on the seabed (\$z_{\\text{bed}}\$) and release
+larvae into near-bottom waters during the spring phytoplankton bloom (Lovrich et al.,
+1995; Sainte-Marie & Sainte-Marie, 1999). Newly hatched Stage I zoeae exhibit strong
+negative geotaxis (active upward swimming against gravity) and positive phototaxis
+(Sulkin, 1984; Forward, 1988).
+
+The active upward swimming velocity \$w_{\\text{ascent}}(z)\$ directed toward the
+productive surface mixed layer (\$z_{\\text{target}}\$) is parameterized via a
+hyperbolic tangent transition scale:
+```math
+w_{\\text{ascent}}(z) = w_{\\text{ascent,max}} \\tanh\\left(
+    \\frac{z_{\\text{target}} - z}{L_{\\text{relax}}}
+\\right)
+```
+where \$w_{\\text{ascent,max}}\$ is the maximum directed ascent speed (typically
+\$0.008\\text{--}0.015\\text{ m s}^{-1} \\approx 8\\text{--}15\\text{ mm s}^{-1}\$),
+\$z_{\\text{target}}\$ is the upper euphotic/mixed layer depth (default \$-10.0\\text{ m}\$),
+and \$L_{\\text{relax}}\$ is the vertical relaxation scale (default \$10.0\\text{ m}\$).
+Deep in the water column (\$z \\ll z_{\\text{target}}\$), \$\\tanh \\approx 1.0\$,
+providing sustained upward swimming. As the larva nears the surface target,
+the velocity smoothly decelerates to zero.
+
+# Inputs
+- `z::Real`: Current vertical coordinate in meters (negative downward).
+- `z_surface_target::Real`: Target epipelagic depth in meters (default -10.0 m).
+- `max_ascent_speed::Real`: Maximum vertical ascent speed in \$m s^{-1}\$ (default 0.010 m/s).
+- `relaxation_depth::Real`: Vertical deceleration scale in meters (default 10.0 m).
+
+# Outputs
+- `Float64`: Vertical ascent velocity in \$m s^{-1}\$ (positive upward).
+
+# References
+- Forward, R. B. (1988). Diel vertical migration: zooplankton photobiology and
+  behaviour. *Oceanography and Marine Biology: An Annual Review*, 26, 361-393.
+- Lovrich, G. A., Sainte-Marie, B., & Smith, B. D. (1995). Depth distribution and
+  seasonal movements of *Chionoecetes opilio* in Baie Sainte-Marguerite.
+  *Canadian Journal of Fisheries and Aquatic Sciences*, 52(4), 903-913.
+- Sainte-Marie, G., & Sainte-Marie, B. (1999). Growth, developmental stages, and
+  vertical distribution of snow crab larvae (*Chionoecetes opilio*).
+  *Canadian Journal of Fisheries and Aquatic Sciences*, 56(11), 2181-2193.
+- Sulkin, S. D. (1984). The behavioral basis of depth regulation in the planktonic
+  larvae of brachyuran crabs. *Marine Ecology Progress Series*, 193-205.
+"""
+function larval_ascent_velocity(
+    z::Real;
+    z_surface_target::Real = -10.0,
+    max_ascent_speed::Real = 0.010,
+    relaxation_depth::Real = 10.0
+)
+    dz = Float64(z_surface_target) - Float64(z)
+    return Float64(max_ascent_speed * tanh(dz / relaxation_depth))
+end
+
+"""
+    diel_vertical_migration_velocity(
+        z::Real,
+        t::Real;
+        stage::Symbol = :zoea1,
+        day_depth::Real = -50.0,
+        night_depth::Real = -10.0,
+        zoea2_day_depth::Real = -55.0,
+        zoea2_night_depth::Real = -8.0,
+        megalopa_day_depth::Real = -120.0,
+        megalopa_night_depth::Real = -60.0,
+        zoea2_depth_factor::Real = 1.2,
+        megalopa_swim_factor::Real = 1.5,
+        max_swim_speed::Real = 0.005,
+        relaxation_depth::Real = 10.0,
+        turbidity_attenuation::Real = 1.0,
+        cil_depth::Union{Nothing, Real} = nothing,
+        initial_ascent::Bool = false,
+        ascent_speed::Real = 0.010,
+        surface_target::Real = -10.0
+    )
+
+Compute active vertical swimming velocity \$w_{\\text{swim}}(z, t)\$ for snow crab
+larvae undergoing stage-dependent Diel Vertical Migration (DVM) or initial post-hatch
+ascent from benthic spawning grounds.
+
+# Mathematical & Ecological Model
+Snow crab (*Chionoecetes opilio*) larvae exhibit stage-dependent vertical
+positioning (Incze et al., 1987; Lovrich et al., 1995; Sainte-Marie & Sainte-Marie, 1999).
+When `initial_ascent = true`, newly released larvae swim actively upward toward the
+surface mixed layer at speed `ascent_speed` via `larval_ascent_velocity`.
+Once established in the pelagic zone (`initial_ascent = false`), planktonic Zoea I and II
+stages occupy shallower depths at night and migrate to deeper, colder layers during the day.
+Semiplanktonic Megalopa larvae actively seek benthic nursery grounds prior to settlement.
+
+The instantaneous target depth \$z_{\\text{target}}(t)\$ over a 24-hour diurnal
+cycle (\$T = 86400\\text{ s}\$) is:
+```math
+z_{\\text{target}}(t) = \\frac{z_{\\text{day}} + z_{\\text{night}}}{2}
+- \\frac{z_{\\text{night}} - z_{\\text{day}}}{2} \\cos\\left( \\frac{2\\pi t}{86400} \\right)
+```
+The active swimming velocity \$w_{\\text{swim}}(z, t)\$ is:
+```math
+w_{\\text{swim}}(z, t) = w_{\\max} \\tanh\\left( \\frac{z_{\\text{target}}(t) - z}{L_{\\text{relax}}} \\right)
+```
+
+# Inputs
+- `z::Real`: Current vertical coordinate (depth in meters, negative downward).
+- `t::Real`: Current simulation time in seconds.
+- `stage::Symbol`: Larval development stage (`:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`).
+- `day_depth::Real`: Zoea I daytime preferred depth in meters (default -50.0 m).
+- `night_depth::Real`: Zoea I nighttime preferred depth in meters (default -10.0 m).
+- `zoea2_day_depth::Real`: Zoea II daytime depth in meters (default -55.0 m).
+- `zoea2_night_depth::Real`: Zoea II nighttime depth in meters (default -8.0 m).
+- `megalopa_day_depth::Real`: Megalopa daytime benthic seeking depth in meters (default -120.0 m).
+- `megalopa_night_depth::Real`: Megalopa nighttime depth in meters (default -60.0 m).
+- `zoea2_depth_factor::Real`: Zoea II swim speed multiplier (default 1.2).
+- `megalopa_swim_factor::Real`: Swimming speed multiplier for Megalopa (default 1.5).
+- `max_swim_speed::Real`: Maximum swimming speed in \$m s^{-1}\$ (default 0.005 m/s ≈ 5 mm/s).
+- `relaxation_depth::Real`: Vertical transition scale \$L_{\\text{relax}}\$ in meters (default 10.0 m).
+- `turbidity_attenuation::Real`: Light cue attenuation factor in turbid coastal plumes (0.0 to 1.0, default 1.0).
+- `cil_depth::Union{Nothing, Real}`: Optional upper depth of the Cold Intermediate Layer (thermocline).
+- `initial_ascent::Bool`: Whether the larva is in the initial post-hatch ascent phase (default false).
+- `ascent_speed::Real`: Upward swimming speed during ascent in \$m s^{-1}\$ (default 0.010 m/s).
+- `surface_target::Real`: Target depth for ascent completion in meters (default -10.0 m).
+
+# Outputs
+- `Float64`: Vertical swimming velocity \$w_{\\text{swim}}\$ in \$m s^{-1}\$.
+
+# References
+- Incze, L. S., Armstrong, D. A., & Smith, S. L. (1987). Abundance of filter-feeding
+  and pelagic stages of crab larvae in the southeastern Bering Sea.
+  *Marine Biology*, 95(2), 195-200. DOI: 10.1007/BF00409006
+- Lovrich, G. A., Sainte-Marie, B., & Smith, B. D. (1995). Depth distribution and
+  seasonal movements of *Chionoecetes opilio* in Baie Sainte-Marguerite.
+  *Canadian Journal of Fisheries and Aquatic Sciences*, 52(4), 903-913.
+- Sainte-Marie, G., & Sainte-Marie, B. (1999). Growth, developmental stages, and
+  vertical distribution of snow crab larvae (*Chionoecetes opilio*).
+  *Canadian Journal of Fisheries and Aquatic Sciences*, 56(11), 2181-2193.
+"""
+function diel_vertical_migration_velocity(
+    z::Real,
+    t::Real;
+    stage::Symbol = :zoea1,
+    day_depth::Real = -50.0,
+    night_depth::Real = -10.0,
+    zoea2_day_depth::Real = -55.0,
+    zoea2_night_depth::Real = -8.0,
+    megalopa_day_depth::Real = -120.0,
+    megalopa_night_depth::Real = -60.0,
+    zoea2_depth_factor::Real = 1.2,
+    megalopa_swim_factor::Real = 1.5,
+    max_swim_speed::Real = 0.005,
+    relaxation_depth::Real = 10.0,
+    turbidity_attenuation::Real = 1.0,
+    cil_depth::Union{Nothing, Real} = nothing,
+    initial_ascent::Bool = false,
+    ascent_speed::Real = 0.010,
+    surface_target::Real = -10.0
+)
+    if stage == :instar1_settled || stage == :dead
+        return 0.0
+    end
+
+    if initial_ascent
+        return larval_ascent_velocity(
+            z,
+            z_surface_target = surface_target,
+            max_ascent_speed = ascent_speed,
+            relaxation_depth = relaxation_depth
+        )
+    end
+
+    z_day, z_night, w_max = if stage == :zoea1
+        (Float64(day_depth), Float64(night_depth), Float64(max_swim_speed))
+    elseif stage == :zoea2
+        # Non-linear ontogenetic niche: Zoea II deepens slightly during daytime
+        # for feeding (-55 m), while nighttime ascent is slightly shallower (-8 m)
+        # to avoid surface predators (Sainte-Marie & Sainte-Marie 1999).
+        (Float64(zoea2_day_depth),
+         Float64(zoea2_night_depth),
+         Float64(max_swim_speed * zoea2_depth_factor))
+    elseif stage == :megalopa
+        (Float64(megalopa_day_depth), Float64(megalopa_night_depth),
+         Float64(max_swim_speed * megalopa_swim_factor))
+    else
+        (Float64(day_depth), Float64(night_depth), Float64(max_swim_speed))
+    end
+
+    diurnal_phase = 2.0 * π * (mod(t, 86400.0)) / 86400.0
+    z_mean = 0.5 * (z_day + z_night)
+    # Positive amplitude modulated by turbidity/light attenuation (Incze et al., 1987)
+    atten = clamp(Float64(turbidity_attenuation), 0.0, 1.0)
+    z_amp = 0.5 * (z_night - z_day) * atten
+    z_target = z_mean - z_amp * cos(diurnal_phase)
+
+    # Ontogenetic niche partitioning relative to CIL boundary
+    if !isnothing(cil_depth)
+        z_cil = Float64(cil_depth)
+        if stage == :zoea1
+            # Zoea I stay within warm surface mixed layer above CIL
+            z_target = max(z_target, z_cil)
+        elseif stage == :zoea2
+            # Zoea II target the pycnocline / CIL upper transition
+            z_target = clamp(z_target, z_cil - 20.0, z_night)
+        elseif stage == :megalopa
+            # Megalopae seek deep CIL for pre-settlement benthic staging
+            z_target = min(z_target, z_cil)
+        end
+    end
+
+    dz = z_target - z
+    w_swim = w_max * tanh(dz / relaxation_depth)
+    return Float64(w_swim)
+end
+
+"""
+    superpose_tidal_velocity(
+        u_mean::Real,
+        v_mean::Real,
+        t::Real;
+        u_amp::Real = 0.25,
+        v_amp::Real = 0.12,
+        period::Real = 44712.0,
+        phase::Real = 0.0
+    )
+
+Superpose semi-diurnal \$M_2\$ tidal current oscillations onto mean hydrodynamic
+background flow.
+
+# Mathematical Formulation
+```math
+u_{\\text{total}}(t) = u_{\\text{mean}} + u_{\\text{amp}} \\cos\\left( \\frac{2\\pi t}{T_{M2}} + \\phi \\right)
+```
+```math
+v_{\\text{total}}(t) = v_{\\text{mean}} + v_{\\text{amp}} \\sin\\left( \\frac{2\\pi t}{T_{M2}} + \\phi \\right)
+```
+where \$T_{M2} \\approx 12.42\\text{ hours} = 44712\\text{ s}\$.
+
+# Inputs
+- `u_mean, v_mean::Real`: Background Eulerian flow velocities in \$m s^{-1}\$.
+- `t::Real`: Current time in seconds.
+- `u_amp, v_amp::Real`: Semi-major and semi-minor tidal velocity amplitudes (m s⁻¹).
+- `period::Real`: Tidal constituent period in seconds (default 44712.0 s for \$M_2\$).
+- `phase::Real`: Initial phase offset in radians.
+- `constituents::Union{Nothing, Vector{Symbol}}`: Optional vector of constituents (e.g. `[:M2, :S2]`).
+- `u_amplitudes, v_amplitudes::Union{Nothing, Dict{Symbol, Float64}}`: Multi-constituent amplitudes.
+- `phases::Union{Nothing, Dict{Symbol, Float64}}`: Multi-constituent phase offsets.
+
+# Outputs
+- `Tuple{Float64, Float64}`: Total velocities `(u_tot, v_tot)`.
+"""
+function superpose_tidal_velocity(
+    u_mean::Real,
+    v_mean::Real,
+    t::Real;
+    u_amp::Real = 0.25,
+    v_amp::Real = 0.12,
+    period::Real = 44712.0,
+    phase::Real = 0.0,
+    constituents::Union{Nothing, Vector{Symbol}} = nothing,
+    u_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
+    v_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
+    phases::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing
+)
+    if !isnothing(constituents) && !isempty(constituents)
+        u_amps = something(u_amplitudes, Dict(:M2 => Float64(u_amp)))
+        v_amps = something(v_amplitudes, Dict(:M2 => Float64(v_amp)))
+        phs    = something(phases, Dict(:M2 => Float64(phase)))
+        u_tide, v_tide = tidal_velocity_vector(
+            t,
+            constituents = constituents,
+            u_amplitudes = u_amps,
+            v_amplitudes = v_amps,
+            phases = phs
+        )
+        return (Float64(u_mean + u_tide), Float64(v_mean + v_tide))
+    else
+        omega = 2.0 * π / period
+        u_tide = u_amp * cos(omega * t + phase)
+        v_tide = v_amp * sin(omega * t + phase)
+        return (Float64(u_mean + u_tide), Float64(v_mean + v_tide))
+    end
+end
+
+"""
+    bbl_velocity_factor(
+        z::Real,
+        z_bed::Real;
+        h_bbl::Real = 10.0,
+        z0::Real = 0.001
+    ) -> Float64
+
+Compute the logarithmic bottom boundary layer (BBL) velocity attenuation factor
+\$f_{\\text{bbl}} \\in [0, 1]\$ based on the law of the wall:
+```math
+f_{\\text{bbl}}(z) = \\frac{\\ln(\\max(z_0, z - z_{\\text{bed}}) / z_0)}{\\ln(h_{\\text{bbl}} / z_0)}
+```
+where \$h_{\\text{bbl}}\$ is the BBL thickness (meters) and \$z_0\$ is bottom roughness length.
+
+# Inputs
+- `z::Real`: Particle vertical depth in meters (negative downward).
+- `z_bed::Real`: Seabed elevation in meters.
+- `h_bbl::Real`: Height of bottom boundary layer in meters (default 10.0 m).
+- `z0::Real`: Bottom roughness length in meters (default 0.001 m).
+
+# Outputs
+- `Float64`: Attenuation factor in \$[0, 1]\$.
+"""
+function bbl_velocity_factor(
+    z::Real,
+    z_bed::Real;
+    h_bbl::Real = 10.0,
+    z0::Real = 0.001
+)
+    dz = Float64(z) - Float64(z_bed)
+    if dz <= 0.0
+        return 0.0
+    elseif dz >= h_bbl
+        return 1.0
+    else
+        return clamp(log(max(z0, dz) / z0) / log(h_bbl / z0), 0.0, 1.0)
+    end
+end
+
+"""
+    larval_passive_sinking_velocity(
+        stage::Symbol;
+        zoea1_sink::Real = -0.0005,
+        zoea2_sink::Real = -0.0010,
+        megalopa_sink::Real = -0.0025
+    ) -> Float64
+
+Compute the passive gravitational settling velocity \$w_{\\text{sink}}\$ in \$m s^{-1}\$
+for snow crab larvae due to excess body density (\$\\Delta \\rho \\approx 15\\text{ kg/m}^3\$).
+
+# Inputs
+- `stage::Symbol`: Developmental stage (`:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`).
+- `zoea1_sink::Real`: Zoea I passive sinking speed in \$m s^{-1}\$ (default -0.5 mm/s).
+- `zoea2_sink::Real`: Zoea II passive sinking speed in \$m s^{-1}\$ (default -1.0 mm/s).
+- `megalopa_sink::Real`: Megalopa passive sinking speed in \$m s^{-1}\$ (default -2.5 mm/s).
+
+# Outputs
+- `Float64`: Sinking velocity in \$m s^{-1}\$ (negative downward).
+
+# References
+- Sainte-Marie, G., & Sainte-Marie, B. (1999). *CJFAS*, 56(11), 2181-2193.
+"""
+function larval_passive_sinking_velocity(
+    stage::Symbol;
+    zoea1_sink::Real = -0.0005,
+    zoea2_sink::Real = -0.0010,
+    megalopa_sink::Real = -0.0025
+)
+    if stage == :zoea1
+        return Float64(zoea1_sink)
+    elseif stage == :zoea2
+        return Float64(zoea2_sink)
+    elseif stage == :megalopa
+        return Float64(megalopa_sink)
+    else
+        return 0.0
+    end
+end
+
+"""
+    draw_molt_thresholds(rng; dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
+                              dd_megalopa_to_settle = 200.0, cv_molt = 0.0) -> NTuple{3,Float64}
+
+Draw one particle's cumulative degree-day thresholds for the three stage transitions.
+
+**Dispersion is applied to the stage increments, not to the cumulative thresholds.** The base
+thresholds are decomposed into the increments needed to pass through them,
+`(b₁, b₂ − b₁, b₃ − b₂)` — for the defaults `(65, 65, 70)` degree-days — each increment is drawn
+from a mean-preserving lognormal, and the thresholds are the running sums:
+
+```math
+t_1 = \\Delta_1, \\quad t_2 = \\Delta_1 + \\Delta_2, \\quad t_3 = \\Delta_1 + \\Delta_2 + \\Delta_3
+```
+
+where `Δₖ = baseₖ · exp(σ·zₖ − σ²/2)`, `σ = sqrt(log(1 + cv_molt²))`, `zₖ ~ Normal(0,1)`.
+
+This construction matters, because the obvious alternatives are both wrong:
+
+* Drawing the **cumulative thresholds** independently and then forcing `t₂ > t₁`, `t₃ > t₂` with
+  `max` looks equivalent but is not: the `max` guard propagates a slow-developer tail upward, so
+  the mean of `t₃` is inflated (measured: 217 degree-days instead of 200 at `cv = 0.5`, and 234 at
+  `cv = 0.75`). `cv_molt` would then be a knob that silently lengthens the expected time to
+  settlement instead of only dispersing it.
+* Drawing a Normal and clamping at zero piles an artificial spike on the floor — at `cv = 0.5`,
+  **2.4 %** of larvae were given a Zoea I duration of about two hours (`cv = 0.75`: 9.5 %).
+
+With increments, **ordering is automatic** (every `Δₖ > 0`), nothing is clamped, and all three
+means are preserved exactly: `E[t₁] = b₁`, `E[t₂] = b₂`, `E[t₃] = b₃`. The *total* requirement is
+less dispersed than any single stage, which is the correct behaviour — variability averages out
+across stages — so the CV of `t₃` is naturally below `cv_molt`.
+
+Because `DD = (T − T_base)·d` for a cohort at fixed temperature, the increment CV is also the stage
+duration CV, so published stage-duration dispersion transfers directly.
+
+**These must be drawn once per particle and then reused**, never redrawn per call. A developmental
+threshold is a fixed property of the individual larva: redrawing it on every timestep resamples the
+developmental rate at random each step, which lets a particle's stage regress (`:zoea2` → `:zoea1`)
+and makes settlement competence flicker on and off. See [`update_larval_stage`](@ref).
+
+# Inputs
+- `rng`: Random number generator.
+- `dd_zoea1_to_zoea2`, `dd_zoea2_to_megalopa`, `dd_megalopa_to_settle`: Base cumulative degree-day
+  thresholds. Must be strictly increasing.
+- `cv_molt`: Coefficient of variation of the stage increments. `0.0` reproduces the base thresholds
+  exactly.
+
+# Outputs
+- `NTuple{3, Float64}`: `(t1, t2, t3)`, strictly increasing.
+"""
+function draw_molt_thresholds(
+    rng::AbstractRNG;
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0,
+    cv_molt::Real = 0.0
+)
+    b1 = Float64(dd_zoea1_to_zoea2)
+    b2 = Float64(dd_zoea2_to_megalopa)
+    b3 = Float64(dd_megalopa_to_settle)
+    if !(cv_molt > 0)
+        return (b1, b2, b3)
+    end
+    # Increments needed to pass through each base threshold in turn. Positive increments are what
+    # make the running sums strictly increasing, so the bases must be strictly increasing.
+    increments = (b1, b2 - b1, b3 - b2)
+    any(x -> !(x > 0.0), increments) && throw(ArgumentError(
+        "draw_molt_thresholds requires strictly increasing cumulative thresholds, got " *
+        "($b1, $b2, $b3); the stage increments must all be positive."))
+
+    d1 = draw_lognormal_mean(increments[1], cv_molt, rng)
+    d2 = draw_lognormal_mean(increments[2], cv_molt, rng)
+    d3 = draw_lognormal_mean(increments[3], cv_molt, rng)
+    return (d1, d1 + d2, d1 + d2 + d3)
+end
+
+"""
+    MoltCDF
+
+A cumulative distribution over cumulative thermal degree-days describing **when a larva reaches a
+developmental threshold**, parameterised by a base mean and a coefficient of variation.
+
+The distribution is a **mean-preserving lognormal**: its arithmetic mean is exactly `base`
+degree-days and its coefficient of variation is exactly `cv`, so `cv` is a pure dispersion knob
+and raising it never changes the expected development rate. The log-scale parameters are
+
+```math
+\\sigma_{\\log} = \\sqrt{\\log(1 + c^2)}, \\qquad
+\\mu_{\\log} = \\ln(m) - \\tfrac{1}{2}\\sigma_{\\log}^2
+```
+
+`c → 0` degenerates continuously to the deterministic point mass at `base`, so the fully
+deterministic path is the exact limit of the stochastic one.
+
+# Fields
+- `mu_log::Float64`: log-scale location.
+- `sigma_log::Float64`: log-scale shape, `≥ 0`.
+"""
+struct MoltCDF
+    mu_log::Float64
+    sigma_log::Float64
+end
+
+"""
+    molt_cdf(base::Real, cv::Real) -> MoltCDF
+
+Build the mean-preserving lognormal threshold distribution with arithmetic mean `base`
+degree-days and coefficient of variation `cv`.
+
+!!! warning "Use `molt_cdf`, not the struct constructor, to parameterise"
+    `MoltCDF` also has a two-argument *default* constructor `MoltCDF(mu_log, sigma_log)`, which is
+    more specific than any `(base, cv)` method for `Float64` arguments and would silently win.
+    Calling `MoltCDF(65.0, 0.25)` would therefore set `mu_log = 65.0`, giving a threshold
+    distribution with median `e^65` instead of 65 degree-days — and nothing would ever moult. The
+    parameterising factory is kept as a distinct function so that mistake cannot recur.
+"""
+function molt_cdf(base::Real, cv::Real)
+    m = Float64(base)
+    m > 0 || throw(ArgumentError("molt_cdf base must be positive, got $m"))
+    σ = lognormal_sigma(cv)
+    return MoltCDF(log(m) - 0.5 * σ * σ, σ)
+end
+
+"""
+    molt_probability(F::MoltCDF, degree_days::Real) -> Float64
+
+Fraction of the cohort that has reached the developmental threshold by `degree_days`, on a 0-to-1
+scale: 0 at zero degree-days, approaching 1 for large `degree_days`.
+
+This is the quantity compared against a larva's developmental quantile, and — evaluated at the
+**cohort mean** degree-days — is directly interpretable as "the proportion of the cohort that has
+completed molting by now". Returned strictly inside `(0, 1)` except at the degenerate `cv = 0`
+limit, where it is the step function at `base`.
+
+Named `molt_probability` rather than `cdf` to avoid shadowing `Distributions.cdf`, which is in
+scope here; the evaluation still goes through the normal CDF for accuracy.
+"""
+@inline function molt_probability(F::MoltCDF, degree_days::Real)
+    d = Float64(degree_days)
+    d <= 0 && return 0.0
+    F.sigma_log <= 0 && return (d >= exp(F.mu_log) ? 1.0 : 0.0)
+    return cdf(Normal(F.mu_log, F.sigma_log), log(d))
+end
+
+"""
+    threshold(F::MoltCDF, u::Real) -> Float64
+
+Inverse CDF: the degree-day threshold reached by a larva whose developmental quantile is `u`.
+`u = 0` is the slowest possible developer, `u = 1` the fastest, and `threshold(F, 0) = 0`,
+`threshold(F, 1) = ∞` in the limit.
+
+For a monotone CDF, `u ≤ cdf(F, d)` is exactly equivalent to `d ≥ threshold(F, u)`, so the
+tracking loop can use whichever form is cheaper.
+"""
+@inline function threshold(F::MoltCDF, u::Real)
+    q = clamp(Float64(u), 0.0, 1.0)
+    F.sigma_log <= 0 && return exp(F.mu_log)
+    return exp(F.mu_log + F.sigma_log * _probit(q))
+end
+
+"""
+    _probit(p::Real) -> Float64
+
+Inverse standard-normal CDF, `Φ⁻¹(p)`, clamped to `(0, 1)` before evaluation. Needed once per
+larva at initialisation, never in the integration loop.
+"""
+function _probit(p::Real)
+    q = clamp(Float64(p), 1e-12, 1 - 1e-12)
+    return quantile(Normal(0.0, 1.0), q)
+end
+
+"""
+    frailty_from_quantile(u::Real, cv::Real) -> Float64
+
+Map a fixed per-larva **vigour quantile** `u ∈ [0, 1]` to a mortality-rate multiplier with mean
+exactly 1 and coefficient of variation exactly `cv`.
+
+This is the mortality analogue of the developmental quantile: one draw per larva, held for life, so
+a weak larva faces a raised mortality rate *throughout* its pelagic period rather than being
+randomised independently at every timestep. It is the standard **unobserved heterogeneity
+(frailty)** model for individual survival: proportional hazards `μ_i = μ · ω_i` with
+`ω ~ lognormal`.
+
+`u` near 0 gives a vigorous larva (multiplier < 1, i.e. it outlives the cohort expectation) and
+`u` near 1 a weak one. `cv = 0` gives exactly 1.0, so the deterministic mean-field path is the
+exact limit.
+
+# Inputs
+- `u::Real`: Vigour quantile in `[0, 1]`, drawn once per larva.
+- `cv::Real`: Coefficient of variation of the multiplier.
+
+# Outputs
+- `Float64`: Strictly positive multiplier, mean 1.
+"""
+@inline function frailty_from_quantile(u::Real, cv::Real)
+    σ = lognormal_sigma(cv)
+    σ <= 0 && return 1.0
+    return exp(σ * _probit(u) - 0.5 * σ * σ)
+end
+
+"""
+    settlement_propensity(u::Real, hsi::Real, cv::Real) -> Float64
+
+Map a fixed per-larva **settlement quantile** `u ∈ [0, 1]` and a site habitat-suitability index
+`hsi ∈ [0, 1]` to that larva's probability of settling there, with mean exactly `hsi` and
+coefficient of variation exactly `cv` — the settlement analogue of the developmental and vigour
+quantiles, so some larvae are ready to settle sooner and at more marginal sites than others.
+
+The perturbation is applied on the log-odds scale (see [`draw_beta_index`](@ref)), so the result
+stays in `[0, 1]` and never pushes the expected settlement rate below `hsi`. `cv` is a pure
+dispersion knob: the *average* larva settles at exactly the site's suitability.
+
+`u` is drawn once per larva and reused at every candidate site, which is what makes it a persistent
+individual propensity rather than fresh noise per evaluation.
+
+# Inputs
+- `u::Real`: Settlement quantile in `[0, 1]`.
+- `hsi::Real`: Site habitat-suitability index in `[0, 1]`.
+- `cv::Real`: Coefficient of variation of the per-larva dispersion.
+
+# Outputs
+- `Float64`: Per-larva settlement probability in `[0, 1]`.
+"""
+@inline function settlement_propensity(u::Real, hsi::Real, cv::Real)
+    h = Float64(hsi)
+    (h <= 0.0) && return 0.0
+    (h >= 1.0) && return 1.0
+    c = abs(Float64(cv))
+    (c > 0) || return h
+    lo = clamp(h, 1e-6, 1.0 - 1e-6)
+    z = log(lo / (1.0 - lo)) + c * _probit(u)
+    return z >= 0 ? 1.0 / (1.0 + exp(-z)) : exp(z) / (1.0 + exp(z))
+end
+
+"""
+    molt_schedule(; dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
+                     dd_megalopa_to_settle = 200.0, cv_molt = 0.0) -> NTuple{3, MoltCDF}
+
+Build the three per-stage threshold distributions as a single immutable *global template*, computed
+once before the simulation rather than per larva and per step.
+
+Each stage is described by its own lognormal with the **cumulative** base mean it needs
+(65 / 130 / 200 degree-days by default), so the three are independent templates rather than
+dispersed increments. Individual variability enters only through each larva's single
+developmental quantile.
+
+# Inputs
+- `dd_zoea1_to_zoea2`, `dd_zoea2_to_megalopa`, `dd_megalopa_to_settle`: Cumulative base
+  degree-day thresholds, strictly increasing.
+- `cv_molt`: Coefficient of variation shared by the three distributions.
+
+# Outputs
+- `NTuple{3, MoltCDF}`: `(zoea1_to_zoea2, zoea2_to_megalopa, megalopa_to_settle)`.
+"""
+function molt_schedule(;
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0,
+    cv_molt::Real = 0.0
+)
+    b = (Float64(dd_zoea1_to_zoea2), Float64(dd_zoea2_to_megalopa), Float64(dd_megalopa_to_settle))
+    (b[1] > 0 && b[1] < b[2] < b[3]) || throw(ArgumentError(
+        "molt_schedule requires 0 < dd_zoea1_to_zoea2 < dd_zoea2_to_megalopa < dd_megalopa_to_settle, " *
+        "got $(b)"))
+    return (molt_cdf(b[1], cv_molt), molt_cdf(b[2], cv_molt), molt_cdf(b[3], cv_molt))
+end
+
+# Which stage index a symbol occupies: :zoea1 = 1 (needs t1), :zoea2 = 2 (t2), :megalopa = 3 (t3).
+@inline molt_stage_index(stage::Symbol) =
+    stage === :zoea1 ? 1 : stage === :zoea2 ? 2 : stage === :megalopa ? 3 : 0
+
+"""
+    update_larval_stage(current_stage::Symbol, degree_days::Real, schedule, developmental_u::Real)
+
+Advance a larva's ontogenetic stage from its accumulated thermal degree-days, a **global
+per-stage threshold schedule**, and the larva's **developmental quantile**.
+
+A larva moults once the cohort-wide probability of having reached the threshold,
+`cdf(schedule[k], degree_days)`, passes its own fixed quantile `developmental_u`. Because
+`developmental_u ∈ [0, 1]` is constant and degree-days are non-decreasing, the returned stage is
+monotone non-decreasing: a larva can never regress.
+
+`developmental_u` is a **developmental percentile** — a fixed draw from `Uniform(0, 1)` per larva,
+reused for all three transitions, so a fast developer stays a fast developer. This models
+developmental rate as an individual quality rather than as independent noise at each stage, and
+makes the three stage durations rank-correlated for an individual.
+
+!!! note "Direction of the quantile: small `u` is a FAST developer"
+    Because a larva moults once the cohort CDF `F(D)` has risen past its own percentile, a **small**
+    `u` is a **fast** developer (it moults early) and a **large** `u` is a **slow** one. In the
+    default `cv_molt = 0.25` case `u = 0.1` moults at roughly 45 degree-days and `u = 0.9` at
+    roughly 92. This is the standard inverse-transform construction: `u` indexes the *threshold*
+    distribution, so a high percentile is a high requirement. If you want the opposite sense
+    (large `u` = fast), draw `1 - rand()` instead; the two are equivalent.
+
+For a monotone CDF this rule is identical to the per-larva threshold rule
+(`u ≤ F(d)` ⟺ `d ≥ F⁻¹(u)`); the CDF form is used because it makes the 0-to-1
+probability structure explicit and the threshold implicit.
+
+# Inputs
+- `current_stage::Symbol`: Present stage.
+- `degree_days::Real`: Accumulated degree-days (°C · days).
+- `schedule`: `NTuple{3, MoltCDF}` from [`molt_schedule`](@ref).
+- `developmental_u::Real`: The larva's fixed developmental quantile in `[0, 1]`.
+
+# Outputs
+- `Symbol`: `:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`, or the input stage if `:dead`.
+"""
+function update_larval_stage(
+    current_stage::Symbol,
+    degree_days::Real,
+    schedule::NTuple{3, MoltCDF},
+    developmental_u::Real
+)
+    (current_stage === :dead || current_stage === :instar1_settled) && return current_stage
+    k = molt_stage_index(current_stage)
+    k == 0 && return current_stage
+    p = molt_probability(schedule[k], degree_days)
+    # Guard on p > 0 as well as u <= p: at the deterministic limit p is exactly 0 below the base
+    # threshold, and `0.0 <= 0.0` would otherwise let a larva whose quantile is exactly 0 molt
+    # before it had accumulated any degree-days at all.
+    (p > 0.0 && developmental_u <= p) || return current_stage
+    return k == 1 ? :zoea2 : k == 2 ? :megalopa : :instar1_settled
+end
+
+# Backwards-compatible keyword form: builds the schedule per call. Prefer passing a prebuilt
+# schedule plus a fixed quantile in time-stepping loops.
+function update_larval_stage(
+    current_stage::Symbol,
+    degree_days::Real;
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0,
+    cv_molt::Real = 0.0,
+    developmental_u::Real = 0.0,
+    rng::AbstractRNG = Random.default_rng()
+)
+    if cv_molt > 0 && developmental_u == 0.0
+        @warn "update_larval_stage called with cv_molt = $(cv_molt) and the default " *
+              "developmental_u = 0.0, so every larva is the slowest possible developer. Draw " *
+              "developmental_u = rand(rng) once per larva and pass it explicitly."
+    end
+    sched = molt_schedule(dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
+                          dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
+                          dd_megalopa_to_settle = dd_megalopa_to_settle,
+                          cv_molt = cv_molt)
+    return update_larval_stage(current_stage, degree_days, sched, developmental_u)
+end
+
+"""
+    cohort_molt_fraction(schedule, mean_degree_days) -> NTuple{3, Float64}
+
+Fraction of a cohort expected to have completed each transition, from the **cohort mean**
+accumulated degree-days: `(F₁(D̄), F₂(D̄), F₃(D̄))`.
+
+This is the direct cohort-level readout of the 0-to-1 probability scale the per-larva quantiles are
+compared against, and is reported per step so the stage progression can be checked directly.
+"""
+@inline function cohort_molt_fraction(schedule::NTuple{3, MoltCDF}, mean_degree_days::Real)
+    return (molt_probability(schedule[1], mean_degree_days),
+            molt_probability(schedule[2], mean_degree_days),
+            molt_probability(schedule[3], mean_degree_days))
+end
+
+"""
+    evaluate_settlement_suitability(
+        bed_elevation::Real,
+        bottom_temperature::Real;
+        min_depth::Real = -250.0,
+        max_depth::Real = -50.0,
+        optimal_min_depth::Real = -180.0,
+        optimal_max_depth::Real = -80.0,
+        min_temp::Real = -1.0,
+        optimal_min_temp::Real = 0.5,
+        optimal_max_temp::Real = 3.5,
+        max_bottom_temp::Real = 6.0,
+        stochastic::Bool = false,
+        rng::AbstractRNG = Random.default_rng()
+    )
+
+Evaluate whether a settling Megalopa/Instar I larva has arrived on suitable benthic
+nursery grounds on the continental shelf using a continuous Habitat Suitability Index (HSI).
+
+# Mathematical & Ecological Formulation
+1. **Depth Suitability Index** \$S_z(z) \\in [0, 1]\$:
+   - Optimal nursery depths: \$z \\in [-180, -80]\\text{ m}\$.
+   - Tapers to 0 at nearshore surf zone (\$z > -50\\text{ m}\$) and offshore abyss (\$z < -250\\text{ m}\$).
+2. **Thermal Suitability Index** \$S_T(T) \\in [0, 1]\$:
+   - Optimal Cold Intermediate Layer (CIL) nursery: \$T \\in [0.5, 3.5]^\\circ\\text{C}\$.
+   - Tapers to 0 at thermal stress threshold (\$T > 6.0^\\circ\\text{C}\$) and superchilling (\$T < -1.0^\\circ\\text{C}\$).
+3. **Combined Habitat Suitability Index**:
+   ```math
+   \\text{HSI}(z, T) = S_z(z) \\times S_T(T) \\in [0, 1]
+   ```
+   In stochastic mode, settlement succeeds if \$r \\sim U(0, 1) \\le \\text{HSI}\$.
+   In deterministic mode, settlement succeeds if \$\\text{HSI} > 0.0\$.
+
+# Inputs
+- `bed_elevation::Real`: Seafloor elevation in meters (negative).
+- `bottom_temperature::Real`: Bottom water temperature in °C.
+- `min_depth::Real`: Deepest boundary for nursery habitat (default -250.0 m).
+- `max_depth::Real`: Shallowest boundary for nursery habitat (default -50.0 m).
+- `optimal_min_depth::Real`: Deep limit of optimal nursery depth (default -180.0 m).
+- `optimal_max_depth::Real`: Shallow limit of optimal nursery depth (default -80.0 m).
+- `min_temp::Real`: Sub-zero superchilling limit in °C (default -1.0 °C).
+- `optimal_min_temp::Real`: Minimum temperature of optimal CIL (default 0.5 °C).
+- `optimal_max_temp::Real`: Maximum temperature of optimal CIL (default 3.5 °C).
+- `max_bottom_temp::Real`: Maximum allowable bottom temperature in °C (default 6.0 °C).
+- `stochastic::Bool`: If true, samples settlement probabilistically from HSI (default false).
+- `rng::AbstractRNG`: Random number generator for stochastic settlement.
+
+# Outputs
+- `NamedTuple`: `(suitable::Bool, probability::Float64, hsi::Float64, reason::String)`
+
+# References
+- Dionne, M., Sainte-Marie, B., Bourget, E., & Gilbert, D. (2003). *MEPS*, 259, 117-128.
+- Sainte-Marie, G., & Sainte-Marie, B. (1999). *MEPS*, 182, 157-174.
+"""
+function evaluate_settlement_suitability(
+    bed_elevation::Real,
+    bottom_temperature::Real;
+    min_depth::Real = -250.0,
+    max_depth::Real = -50.0,
+    optimal_min_depth::Real = -180.0,
+    optimal_max_depth::Real = -80.0,
+    min_temp::Real = -1.0,
+    optimal_min_temp::Real = 0.5,
+    optimal_max_temp::Real = 3.5,
+    max_bottom_temp::Real = 6.0,
+    stochastic::Bool = false,
+    cv_settlement::Real = 0.0,
+    rng::AbstractRNG = Random.default_rng()
+)
+    z = Float64(bed_elevation)
+    T = Float64(bottom_temperature)
+
+    # Depth suitability S_z
+    s_z = if z > max_depth || z < min_depth
+        0.0
+    elseif z >= optimal_min_depth && z <= optimal_max_depth
+        1.0
+    elseif z > optimal_max_depth
+        (z - max_depth) / (optimal_max_depth - max_depth)
+    else
+        (z - min_depth) / (optimal_min_depth - min_depth)
+    end
+
+    # Thermal suitability S_T
+    s_t = if T < min_temp || T > max_bottom_temp
+        0.0
+    elseif T >= optimal_min_temp && T <= optimal_max_temp
+        1.0
+    elseif T > optimal_max_temp
+        (max_bottom_temp - T) / (max_bottom_temp - optimal_max_temp)
+    else
+        (T - min_temp) / (optimal_min_temp - min_temp)
+    end
+
+    hsi = clamp(s_z * s_t, 0.0, 1.0)
+
+    # Stochastic settlement: HSI gate, then a per-larva Bernoulli draw.
+    #
+    # `cv_settlement` perturbs the suitability *index*, which is a bounded probability, so it uses
+    # a Beta dispersion rather than the lognormal used for the positive rate-like quantities. A
+    # Normal clipped to [0,1] is not mean preserving: at the optimum (hsi = 1) half the mass clips
+    # down below 1, so the expected acceptance falls below hsi and raising `cv_settlement` would
+    # silently *reduce* settlement. See draw_beta_index.
+    if hsi == 0.0
+        suitable = false
+        p_accept = 0.0
+    elseif stochastic && cv_settlement > 0.0
+        p_accept = draw_beta_index(hsi, cv_settlement, rng)
+        suitable = rand(rng) <= p_accept
+    elseif stochastic
+        # Traditional Bernoulli with HSI as probability
+        p_accept = hsi
+        suitable = rand(rng) <= hsi
+    else
+        # Deterministic: any positive HSI succeeds
+        p_accept = hsi
+        suitable = hsi > 0.0
+    end
+
+    reason = if hsi == 0.0
+        if z > max_depth
+            "Too shallow / nearshore surf zone (z > $(max_depth)m)"
+        elseif z < min_depth
+            "Too deep / offshore abyssal slope (z < $(min_depth)m)"
+        elseif T > max_bottom_temp
+            "Thermal stress / bottom temp > $(max_bottom_temp)°C"
+        else
+            "Sub-zero thermal stress (T < $(min_temp)°C)"
+        end
+    elseif !suitable && stochastic
+        "HSI=$(round(hsi, digits=3)) but random draw exceeded acceptance probability p=$(round(p_accept, digits=3))"
+else
+            "Suitable (HSI=$(round(hsi, digits=3))"
+        end
+
+    return (suitable = suitable, probability = Float64(p_accept), hsi = Float64(hsi), reason = reason)
+end
+
+"""
+    larval_transport_step(
+        x::Real,
+        y::Real,
+        z::Real,
+        u::Real,
+        v::Real,
+        w::Real,
+        κ_h::Real,
+        κ_v::Real,
+        dt::Real;
+        t::Real = 0.0,
+        stage::Symbol = :zoea1,
+        z_bottom::Real = -1000.0,
+        z_surface::Real = 0.0,
+        is_lat_lon::Bool = true,
+        rng::AbstractRNG = Random.default_rng()
+    )
+
+Perform a single stochastic Lagrangian transport step combining hydrodynamic
+advection, turbulent diffusion, active larval vertical swimming, and absorbing
+shoreline boundary dynamics with alongshore tangential slip.
+
+# Inputs
+- `x, y, z::Real`: Current coordinates of the larva (longitude/x, latitude/y, depth).
+- `u, v, w::Real`: Fluid velocity components at particle position in \$m s^{-1}\$.
+- `κ_h::Real`: Horizontal eddy diffusivity in \$m^2 s^{-1}\$.
+- `κ_v::Real`: Vertical eddy diffusivity in \$m^2 s^{-1}\$.
+- `dt::Real`: Time step in seconds.
+- `t::Real`: Current simulation time in seconds.
+- `stage::Symbol`: Larval stage (`:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`).
+- `z_bottom::Real`: Local seabed elevation in meters.
+- `z_surface::Real`: Sea surface elevation (default 0.0 m).
+- `is_lat_lon::Bool`: If true, converts metric displacements into spherical degrees.
+- `is_ascending::Bool`: Whether larva is currently in directed vertical ascent phase (default false).
+- `ascent_speed::Real`: Upward swimming speed during ascent in \$m s^{-1}\$ (default 0.010 m/s).
+- `surface_target::Real`: Target epipelagic depth for ascent in meters (default -10.0 m).
+- `u_stokes::Real`: Surface zonal Stokes drift velocity in \$m s^{-1}\$ (default 0.0 m/s).
+- `v_stokes::Real`: Surface meridional Stokes drift velocity in \$m s^{-1}\$ (default 0.0 m/s).
+- `stokes_decay_depth::Real`: Depth e-folding scale for Stokes drift decay in meters (default 10.0 m).
+- `rng::AbstractRNG`: Random number generator.
+
+# Outputs
+- `Tuple{Float64, Float64, Float64}`: Updated coordinates `(x_new, y_new, z_new)`.
+
+# References
+- North, E. W., et al. (2008). Simulating dispersal of marine organisms: validation and
+  sensitivity. *Marine Ecology Progress Series*, 372, 283-294.
+"""
+function larval_transport_step(
+    x::Real,
+    y::Real,
+    z::Real,
+    u::Real,
+    v::Real,
+    w::Real,
+    κ_h::Real,
+    κ_v::Real,
+    dt::Real;
+    t::Real = 0.0,
+    stage::Symbol = :zoea1,
+    z_bottom::Real = -1000.0,
+    z_surface::Real = 0.0,
+    is_lat_lon::Bool = true,
+    coastline = nothing,
+    enable_bbl::Bool = true,
+    h_bbl::Real = 10.0,
+    z0::Real = 0.001,
+    enable_sinking::Bool = true,
+    zoea1_sink::Real = -0.0005,
+    zoea2_sink::Real = -0.0010,
+    megalopa_sink::Real = -0.0025,
+    κ_v_gradient::Real = 0.0,
+    is_ascending::Bool = false,
+    ascent_speed::Real = 0.010,
+    surface_target::Real = -10.0,
+    u_stokes::Real = 0.0,
+    v_stokes::Real = 0.0,
+    stokes_decay_depth::Real = 10.0,
+    max_current_speed::Union{Nothing, Real} = 3.0,
+    rng::AbstractRNG = Random.default_rng()
+)
+    # If settled on bottom or dead, particle remains at seabed
+    if stage == :instar1_settled
+        return (Float64(x), Float64(y), Float64(z_bottom))
+    end
+
+    # 0. Guard against a non-physical background current.
+    #
+    # A Lagrangian integrator moves the particle by `u*dt`, so a single corrupt or diverged
+    # velocity cell can teleport a larva across the entire domain in one step. Long
+    # hydrodynamics runs do diverge locally -- the two-year Scotian Shelf archive reaches
+    # ~5600 m/s in its tail, even though its median stays near 0.03 m/s -- and without this
+    # clamp the cohort disperses to nonsense positions and no longer settles on the nursery.
+    # `max_current_speed` is the largest horizontal speed admitted; the direction is preserved
+    # and only the magnitude is capped. Pass `nothing` to disable.
+    if !isnothing(max_current_speed)
+        spd = hypot(u, v)
+        cap = Float64(max_current_speed)
+        if isfinite(spd) && spd > cap
+            s = cap / spd
+            u = u * s
+            v = v * s
+        end
+    end
+
+    # 1. Logarithmic Bottom Boundary Layer (BBL) velocity attenuation (law of the wall)
+    f_bbl = enable_bbl ? bbl_velocity_factor(z, z_bottom, h_bbl = h_bbl, z0 = z0) : 1.0
+
+    # Wave-induced Stokes drift with exponential surface attenuation: u_s(z) = u_s0 * exp(2kz)
+    f_stokes = (u_stokes != 0.0 || v_stokes != 0.0) ? exp(max(-20.0, z / max(1.0, stokes_decay_depth))) : 0.0
+
+    u_eff = u * f_bbl + u_stokes * f_stokes
+    v_eff = v * f_bbl + v_stokes * f_stokes
+
+    # 2. Vertical swimming and passive gravitational settling
+    w_swim = diel_vertical_migration_velocity(
+        z,
+        t;
+        stage = stage,
+        initial_ascent = is_ascending,
+        ascent_speed = ascent_speed,
+        surface_target = surface_target
+    )
+    w_sink = enable_sinking ? larval_passive_sinking_velocity(
+        stage,
+        zoea1_sink = zoea1_sink,
+        zoea2_sink = zoea2_sink,
+        megalopa_sink = megalopa_sink
+    ) : 0.0
+
+    ξ_x = randn(rng)
+    ξ_y = randn(rng)
+    ξ_z = randn(rng)
+
+    dx_meters = u_eff * dt + sqrt(max(0.0, 2.0 * κ_h * dt)) * ξ_x
+    dy_meters = v_eff * dt + sqrt(max(0.0, 2.0 * κ_h * dt)) * ξ_y
+
+    # 3. Visser (1997) diffusive pseudo-drift correction: dκ_v/dz term prevents artificial
+    # accumulation of particles in low-diffusivity pycnoclines
+    dz_meters = (w + w_swim + w_sink + κ_v_gradient) * dt + sqrt(max(0.0, 2.0 * κ_v * dt)) * ξ_z
+
+    if is_lat_lon
+        r_earth = 6.371e6
+        # Protect near-pole singularity: clamp latitude and bound cos(lat) at 85° Web Mercator cutoff
+        lat_rad = deg2rad(clamp(Float64(y), -85.0, 85.0))
+        cos_lat = max(cos(lat_rad), cosd(85.0))
+        deg_per_meter_lat = 180.0 / (π * r_earth)
+        deg_per_meter_lon = 180.0 / (π * r_earth * cos_lat)
+
+        x_raw = x + dx_meters * deg_per_meter_lon
+        y_raw = y + dy_meters * deg_per_meter_lat
+
+        # Periodic antimeridian wrapping to [-180, 180]
+        x_new = mod(x_raw + 180.0, 360.0) - 180.0
+        y_new = clamp(y_raw, -89.9, 89.9)
+    else
+        x_new = x + dx_meters
+        y_new = y + dy_meters
+    end
+    z_new = z + dz_meters
+
+    # Absorbing vertical boundaries: larvae cannot exit surface or penetrate seabed
+    z_new = clamp(z_new, z_bottom, z_surface)
+
+    # Land boundary condition: absorbing shoreline with alongshore tangential slip.
+    # When a larva steps onto land, we estimate the local land-sea boundary gradient,
+    # decompose the displacement into normal and tangential components, and project along
+    # the tangential alongshore direction. If oblique slip is still blocked, we bisect
+    # the displacement along the tangent, falling back to absorbing at (x, y) if fully trapped.
+    if is_lat_lon && is_point_on_land(x_new, y_new, coastline = coastline)
+        # Probe local land occupancy around the candidate point to estimate land normal
+        δ_lon = deg_per_meter_lon * max(100.0, abs(dx_meters) * 0.1)
+        δ_lat = deg_per_meter_lat * max(100.0, abs(dy_meters) * 0.1)
+
+        land_e = is_point_on_land(x_new + δ_lon, y_new, coastline = coastline) ? 1.0 : 0.0
+        land_w = is_point_on_land(x_new - δ_lon, y_new, coastline = coastline) ? 1.0 : 0.0
+        land_n = is_point_on_land(x_new, y_new + δ_lat, coastline = coastline) ? 1.0 : 0.0
+        land_s = is_point_on_land(x_new, y_new - δ_lat, coastline = coastline) ? 1.0 : 0.0
+
+        grad_x = (land_e - land_w) / max(1e-6, 2.0 * δ_lon)
+        grad_y = (land_n - land_s) / max(1e-6, 2.0 * δ_lat)
+        grad_norm = hypot(grad_x, grad_y)
+
+        slip_found = false
+        if grad_norm > 1e-9
+            # Unit outward normal pointing into land
+            nx = grad_x / grad_norm
+            ny = grad_y / grad_norm
+
+            # Candidate alongshore tangent vector (orthogonal to land normal)
+            tx = -ny
+            ty = nx
+
+            # Project displacement onto alongshore tangent
+            proj = dx_meters * deg_per_meter_lon * tx + dy_meters * deg_per_meter_lat * ty
+            cand_x = x + proj * tx
+            cand_y = y + proj * ty
+
+            if !is_point_on_land(cand_x, cand_y, coastline = coastline)
+                x_new = cand_x
+                y_new = cand_y
+                slip_found = true
+            else
+                # Bisect along tangent
+                cand_half_x = x + 0.5 * proj * tx
+                cand_half_y = y + 0.5 * proj * ty
+                if !is_point_on_land(cand_half_x, cand_half_y, coastline = coastline)
+                    x_new = cand_half_x
+                    y_new = cand_half_y
+                    slip_found = true
+                end
+            end
+        end
+
+        # Fallback to orthogonal axis-aligned slip if gradient projection was blocked
+        if !slip_found
+            x_zonal = x + dx_meters * deg_per_meter_lon
+            y_merid = y + dy_meters * deg_per_meter_lat
+            if !is_point_on_land(x_zonal, y, coastline = coastline)
+                x_new = x_zonal
+                y_new = Float64(y)
+            elseif !is_point_on_land(x, y_merid, coastline = coastline)
+                x_new = Float64(x)
+                y_new = y_merid
+            else
+                # Both alongshore candidates on land: absorb at previous valid marine location
+                x_new = Float64(x)
+                y_new = Float64(y)
+            end
+        end
+    end
+
+    return (Float64(x_new), Float64(y_new), Float64(z_new))
+end
+
+"""
+    initialize_larval_particles(
+        n_particles::Int;
+        lon_range::Tuple{Real, Real} = (-64.0, -60.0),
+        lat_range::Tuple{Real, Real} = (43.5, 45.5),
+        depth_range::Tuple{Real, Real} = (-60.0, -20.0),
+        min_seabed_depth::Real = 100.0,
+        buffer_km::Real = 0.0,
+        bathymetry = nothing,
+        coastline = nothing,
+        stratum::Union{Nothing, NamedTuple, Symbol, AbstractString} = nothing,
+        stage::Symbol = :zoea1,
+        max_attempts::Int = 100000,
+        rng::AbstractRNG = Random.default_rng()
+    )
+
+Initialize an ensemble of snow crab larval particle states across a specified
+spawning area, spatial stratum, or extended buffered marine envelope on the
+continental shelf. Strict marine water and high-resolution coastline land exclusion
+constraints are enforced so that larvae are placed strictly in active marine water
+columns and never on emergent land.
+
+# Spatial Buffering & Land Exclusion
+1. **User-Defined Buffer Envelope**: When `buffer_km > 0.0` (e.g. default 100 km), the release
+   domain is expanded outward by \$\\Delta\\phi = d_{\\text{buf}}/R_{\\text{earth}}\$ and
+   \$\\Delta\\lambda = \\Delta\\phi / \\cos(\\phi_0)\$ to capture inflow, upstream advection,
+   and transboundary exchange across administrative boundaries.
+2. **Stratum & CFA Polygon Seeding**: When `stratum` is provided (e.g. `:cfa4x`, `:cfasouth`,
+   `:cfanorth`, or a polygon `NamedTuple`), particles are sampled across the stratum or its
+   buffered marine envelope.
+3. **Strict Coastline Land Rejection**: For every candidate coordinate, `!is_point_on_land(lon, lat)`
+   and \$z_{\\text{bed}} \\le -h_{\\text{min}}\$ are strictly enforced.
+
+# Inputs
+- `n_particles::Int`: Total number of particles to release.
+- `lon_range::Tuple{Real, Real}`: Longitude release bounds (used if `stratum = nothing`).
+- `lat_range::Tuple{Real, Real}`: Latitude release bounds (used if `stratum = nothing`).
+- `depth_range::Union{Nothing, Tuple{Real, Real}}`: Depth release bounds in meters (used if
+  `release_depth_mode = :range`, default nothing).
+- `release_depth_mode::Union{Nothing, Symbol}`: Vertical release mode: `:bottom` (default,
+  near seabed), `:range` (within `depth_range`), or `:surface` (near surface mixed layer).
+- `bottom_offset::Tuple{Real, Real}`: Vertical elevation range above seabed in meters when
+  `release_depth_mode = :bottom` (default (0.5, 3.0) m).
+- `ascent_target_depth::Real`: Target epipelagic depth in meters (default -10.0 m).
+- `min_seabed_depth::Real`: Minimum water depth in meters (default 100.0 m, min 0.0 m).
+- `buffer_km::Real`: Spatial buffer distance in km beyond stratum/domain bounds (default 0.0 km).
+- `bathymetry`: Bathymetry source (`NamedTuple` of `elevation`/`lon`/`lat`, a `GeoDataset`,
+  an elevation `Function` `(lon, lat) -> z`, or `nothing`).
+- `bathymetry_fn`: Alias for `bathymetry`.
+- `coastline`: Optional coastline multi-polygon definitions.
+- `stratum`: Optional target stratum (`NamedTuple` with `:lons, :lats`, or CFA symbol `:cfa4x`, etc.).
+- `stage::Symbol`: Initial stage (`:zoea1`, `:zoea2`, `:megalopa`).
+- `max_attempts::Int`: Maximum rejection sampling attempts per particle (default 100000).
+- `rng::AbstractRNG`: Random number generator.
+
+# Outputs
+- `NamedTuple`: Arrays `(lon, lat, depth, stage, id, degree_days, alive, settlement_status)`.
+"""
+function initialize_larval_particles(
+    n_particles::Int;
+    lon_range::Tuple{Real, Real} = (-64.0, -60.0),
+    lat_range::Tuple{Real, Real} = (43.5, 45.5),
+    depth_range::Union{Nothing, Tuple{Real, Real}} = nothing,
+    release_depth_mode::Union{Nothing, Symbol} = nothing,
+    bottom_offset::Tuple{Real, Real} = (0.5, 3.0),
+    ascent_target_depth::Real = -10.0,
+    min_seabed_depth::Real = 100.0,
+    buffer_km::Real = 0.0,
+    bathymetry::Union{Nothing, Function, NamedTuple, GeoDataset} = nothing,
+    bathymetry_fn::Union{Nothing, Function, NamedTuple, GeoDataset} = nothing,
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
+    stratum::Union{Nothing, NamedTuple, Symbol, AbstractString} = nothing,
+    stage::Symbol = :zoea1,
+    max_attempts::Int = 100000,
+    rng::AbstractRNG = Random.default_rng()
+)
+    if n_particles <= 0
+        error("Number of particles must be positive: $(n_particles)")
+    end
+
+    eff_mode = if !isnothing(release_depth_mode)
+        release_depth_mode
+    elseif !isnothing(depth_range)
+        :range
+    else
+        :bottom
+    end
+
+    sample_initial_depth = function(bed_z::Float64)
+        if eff_mode == :bottom
+            Δz = bottom_offset[1] + rand(rng, Float64) * (bottom_offset[2] - bottom_offset[1])
+            return clamp(bed_z + Δz, bed_z, -1.0)
+        elseif eff_mode == :surface
+            z_surf = ascent_target_depth + rand(rng, Float64) * 5.0
+            return clamp(z_surf, bed_z, -1.0)
+        else # :range
+            drange = something(depth_range, (-60.0, -20.0))
+            raw_z = drange[1] + rand(rng, Float64) * (drange[2] - drange[1])
+            return clamp(raw_z, bed_z + 2.0, -1.0)
+        end
+    end
+
+    # Auto-resolve bathymetry if not explicitly provided. There is no default file: a
+    # hard-coded path would let two callers disagree about which product they read, and
+    # nothing downstream could tell. Depth-dependent seeding therefore requires the caller to
+    # state its sea floor -- through `GeoDataSources`, which decides which product and file.
+    resolved_bathy = if !isnothing(bathymetry)
+        bathymetry
+    elseif !isnothing(bathymetry_fn)
+        bathymetry_fn
+    else
+        nothing
+    end
+
+    # Auto-resolve stratum polygon if requested by name/symbol
+    resolved_stratum_poly = if stratum isa NamedTuple && hasproperty(stratum, :lons) && hasproperty(stratum, :lats)
+        stratum
+    elseif stratum isa Union{Symbol, AbstractString}
+        cfa_list = load_cfa_polygons("inputs")
+        s_code = Symbol(lowercase(string(stratum)))
+        found = findfirst(p -> p.code == s_code, cfa_list)
+        if isnothing(found)
+            error("Stratum '$(stratum)' not found in loaded CFA polygons.")
+        end
+        cfa_list[found]
+    else
+        nothing
+    end
+
+    # Determine base bounding box
+    raw_lon_range, raw_lat_range = if !isnothing(resolved_stratum_poly)
+        (extrema(resolved_stratum_poly.lons), extrema(resolved_stratum_poly.lats))
+    else
+        (lon_range, lat_range)
+    end
+
+    # Apply spatial buffer if buffer_km > 0
+    eff_lon_range, eff_lat_range = if buffer_km > 0.0
+        expand_domain_with_buffer(raw_lon_range, raw_lat_range, buffer_km = buffer_km)
+    else
+        (raw_lon_range, raw_lat_range)
+    end
+
+    lons = Vector{Float64}(undef, n_particles)
+    lats = Vector{Float64}(undef, n_particles)
+    depths = Vector{Float64}(undef, n_particles)
+
+    h_min = max(0.0, Float64(min_seabed_depth))
+
+    # Fast deterministic marine grid sampling if a dataset is available and there is no strict
+    # unbuffered polygon. The sampling takes a `GeoDataset`, so a run resolves one through
+    # `GeoDataSources.bathymetry_dataset` and passes it; nothing here opens a file.
+    use_grid_sampling = (resolved_bathy isa GeoDataset) &&
+                        (isnothing(resolved_stratum_poly) || buffer_km > 0.0)
+
+    if use_grid_sampling && isnothing(resolved_stratum_poly)
+          # Access goes through GeoData: `sample_marine_cells` takes a dataset rather than a
+          # path. The old `sample_marine_coordinates` was exported by this module but defined
+          # nowhere, so this call could only ever have raised.
+          sampled = sample_marine_cells(n_particles; bathymetry_ds = resolved_bathy,
+                                        min_seabed_depth = h_min,
+                                        coastlines = coastline, rng = rng)
+          sampled_lons, sampled_lats, sampled_zbed = sampled.lons, sampled.lats,
+                                                  -sampled.depths
+        lons .= sampled_lons
+        lats .= sampled_lats
+
+        for p in 1:n_particles
+            depths[p] = sample_initial_depth(sampled_zbed[p])
+        end
+    else
+        bathy_fn = if resolved_bathy isa Function
+            resolved_bathy
+        elseif resolved_bathy isa GeoDataset
+            GeoData.get_bathymetry_interpolator(resolved_bathy)
+        elseif resolved_bathy isa NamedTuple
+            # Arrays, in the `(elevation, lon, lat)` contract `bathymetry_arrays` returns.
+            hasproperty(resolved_bathy, :elevation) || error(
+                "Bathymetry NamedTuple has no `elevation` field; it has " *
+                "$(propertynames(resolved_bathy)). Use `GeoDataSources.bathymetry_arrays` " *
+                "to build one.")
+            GeoData.get_bathymetry_interpolator(
+                Float64.(resolved_bathy.elevation),
+                Float64.(collect(resolved_bathy.lon)),
+                Float64.(collect(resolved_bathy.lat)))
+        else
+            nothing
+        end
+
+        total_attempts = 0
+        accepted = 0
+        max_total_attempts = max_attempts * n_particles
+
+        while accepted < n_particles
+            total_attempts += 1
+            if total_attempts > max_total_attempts
+                target_desc = !isnothing(resolved_stratum_poly) ?
+                              "stratum '$(resolved_stratum_poly.name)' (buffer = $(buffer_km) km)" :
+                              "longitude $(eff_lon_range) and latitude $(eff_lat_range)"
+                error(
+                    "Unable to place $(n_particles) larvae with min_seabed_depth = $(min_seabed_depth) m " *
+                    "within $(target_desc) after $(total_attempts) attempts. " *
+                    "Please verify that the target area contains sufficient marine water depth."
+                )
+            end
+
+            cand_lon = eff_lon_range[1] + rand(rng, Float64) * (eff_lon_range[2] - eff_lon_range[1])
+            cand_lat = eff_lat_range[1] + rand(rng, Float64) * (eff_lat_range[2] - eff_lat_range[1])
+
+            # 1. Stratum polygon enclosure check (if specified and buffer_km == 0)
+            if !isnothing(resolved_stratum_poly) && buffer_km <= 0.0
+                if !point_in_polygon(cand_lon, cand_lat, resolved_stratum_poly.lons, resolved_stratum_poly.lats)
+                    continue
+                end
+            end
+
+            # 2. Strict coastline land rejection
+            if is_point_on_land(cand_lon, cand_lat; coastline = coastline)
+                continue
+            end
+
+            # 3. Bathymetric elevation constraint
+            z_bed = !isnothing(bathy_fn) ? bathy_fn(cand_lon, cand_lat) : -h_min - 10.0
+            if z_bed > -h_min || z_bed >= 0.0
+                continue
+            end
+
+            cand_z = sample_initial_depth(z_bed)
+
+            accepted += 1
+            lons[accepted] = cand_lon
+            lats[accepted] = cand_lat
+            depths[accepted] = cand_z
+        end
+    end
+
+    stages = fill(stage, n_particles)
+    ids = collect(1:n_particles)
+    degree_days = zeros(Float64, n_particles)
+    alive = fill(true, n_particles)
+    settlement_status = fill(:pelagic, n_particles)
+
+    return (
+        lon = lons,
+        lat = lats,
+        depth = depths,
+        stage = stages,
+        id = ids,
+        degree_days = degree_days,
+        alive = alive,
+        settlement_status = settlement_status
+    )
+end
+
+"""
+    track_larval_cohort(
+        larvae::NamedTuple;
+        velocity_fn::Function,
+        temperature_fn::Union{Nothing, Function} = nothing,
+        bathymetry_fn::Union{Nothing, Function} = nothing,
+        total_duration::Real = 86400.0,
+        dt::Real = 300.0,
+        κ_h::Real = 10.0,
+        κ_v::Real = 1e-4,
+        is_lat_lon::Bool = true,
+        enable_tides::Bool = false,
+        enable_molting::Bool = true,
+        rng::AbstractRNG = Random.default_rng()
+    )
+
+Simulate Lagrangian trajectories for an ensemble cohort of snow crab larvae,
+integrating in-situ degree-day accumulation, stage molting, thermal mortality,
+and benthic settlement suitability.
+
+# Inputs
+- `larvae::NamedTuple`: Initial particle ensemble from `initialize_larval_particles`.
+- `velocity_fn::Function`: Function `(lon, lat, z, t) -> (u, v, w)` returning flow velocities.
+- `temperature_fn::Union{Nothing, Function}`: Optional `(lon, lat, z, t) -> T_celsius`.
+- `bathymetry_fn::Union{Nothing, Function}`: Optional `(lon, lat) -> z_bottom`.
+- `total_duration::Real`: Total tracking duration in seconds.
+- `dt::Real`: Lagrangian integration time step in seconds.
+- `κ_h::Real`: Horizontal turbulent eddy diffusivity in \$m^2 s^{-1}\$.
+- `κ_v::Real`: Vertical turbulent eddy diffusivity in \$m^2 s^{-1}\$.
+- `is_lat_lon::Bool`: Coordinate format flag.
+- `enable_tides::Bool`: Whether to superpose \$M_2\$ tidal currents.
+- `enable_molting::Bool`: Whether to update stages via thermal degree-days.
+- `default_temperature::Real`: Fallback temperature if `temperature_fn = nothing` (default 4.0 °C).
+- `default_bottom_depth::Real`: Fallback seabed depth if `bathymetry_fn = nothing` (default -1000.0 m).
+- `t_base::Real`: Baseline development threshold temperature \$T_0\$ for degree-days (default 0.0 °C).
+- `dd_zoea1_to_zoea2::Real`: Degree-day threshold for Zoea I -> Zoea II molt (default 150.0).
+- `dd_zoea2_to_megalopa::Real`: Degree-day threshold for Zoea II -> Megalopa molt (default 310.0).
+- `dd_megalopa_to_settle::Real`: Degree-day threshold for Megalopa -> Instar I settlement (default 510.0).
+- `mortality_base::Real`: Baseline daily natural mortality rate (default 0.02 day⁻¹).
+- `mortality_thermal_threshold::Real`: Thermal stress mortality threshold in °C (default 10.0 °C).
+- `mortality_thermal_sensitivity::Real`: Thermal mortality multiplier (default 0.015).
+- `settlement_min_depth::Real`: Deepest boundary for nursery settlement habitat (default -250.0 m).
+- `settlement_max_depth::Real`: Shallowest boundary for nursery settlement habitat (default -50.0 m).
+- `settlement_max_temp::Real`: Maximum bottom temperature for suitable settlement (default 6.0 °C).
+- `settlement_stochastic::Bool`: Whether to evaluate settlement probabilistically via HSI (default true).
+- `competence_window_days::Real`: Maximum pelagic search window for competent megalopae in days (default 15.0 days).
+- `tidal_u_amp::Real`: Zonal tidal velocity amplitude in m/s (default 0.25 m/s).
+- `tidal_v_amp::Real`: Meridional tidal velocity amplitude in m/s (default 0.12 m/s).
+- `tidal_period::Real`: Tidal constituent period in seconds (default 44712.0 s).
+- `tidal_phase::Real`: Tidal initial phase offset in radians (default 0.0).
+- `min_survival_prob::Real`: Survival probability below which particle is marked dead (default 0.01).
+- `enable_initial_ascent::Bool`: Whether newly released larvae perform directed vertical ascent
+  from benthic release depths to the surface mixed layer (default true).
+- `ascent_speed::Real`: Upward swimming speed during ascent in \$m s^{-1}\$ (default 0.010 m/s).
+- `ascent_target_depth::Real`: Target epipelagic depth for ascent in meters (default -10.0 m).
+- `max_ascent_duration::Real`: Maximum allowed duration for initial ascent in seconds (default 86400.0 s).
+- `rng::AbstractRNG`: Random number generator.
+
+# Outputs
+- `NamedTuple`: Trajectory record containing `(lons, lats, depths, stages, degree_days, alive, settlement_status, times, ids, ascent_duration)`.
+"""
+function track_larval_cohort(
+    larvae::NamedTuple;
+    velocity_fn::Function,
+    temperature_fn::Union{Nothing, Function} = nothing,
+    bathymetry_fn::Union{Nothing, Function} = nothing,
+    total_duration::Real = 86400.0,
+    dt::Real = 300.0,
+    κ_h::Real = 10.0,
+    κ_v::Real = 1e-4,
+    is_lat_lon::Bool = true,
+    enable_tides::Bool = false,
+    enable_molting::Bool = true,
+    default_temperature::Real = 4.0,
+    default_bottom_depth::Real = -1000.0,
+    t_base::Real = -1.5,
+    dd_zoea1_to_zoea2::Real = 65.0,
+    dd_zoea2_to_megalopa::Real = 130.0,
+    dd_megalopa_to_settle::Real = 200.0,
+    mortality_base::Real = 0.02,
+    mortality_thermal_threshold::Real = 7.0,
+    mortality_thermal_sensitivity::Real = 0.015,
+    mortality_cold_threshold::Real = -1.5,
+    mortality_cold_sensitivity::Real = 0.01,
+    settlement_min_depth::Real = -250.0,
+    settlement_max_depth::Real = -50.0,
+    settlement_max_temp::Real = 6.0,
+    settlement_stochastic::Bool = true,
+    competence_window_days::Real = 15.0,
+    tidal_u_amp::Real = 0.25,
+    tidal_v_amp::Real = 0.12,
+    tidal_period::Real = 44712.0,
+    tidal_phase::Real = 0.0,
+    tidal_constituents::Union{Nothing, Vector{Symbol}} = nothing,
+    tidal_u_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
+    tidal_v_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
+    tidal_phases::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
+    enable_bbl::Bool = true,
+    h_bbl::Real = 10.0,
+    z0::Real = 0.001,
+    enable_sinking::Bool = true,
+    zoea1_sink::Real = -0.0005,
+    zoea2_sink::Real = -0.0010,
+    megalopa_sink::Real = -0.0025,
+    κ_v_profile::Union{Nothing, Function} = nothing,
+    min_survival_prob::Real = 0.01,
+    coastline = nothing,
+    enable_initial_ascent::Bool = true,
+    ascent_speed::Real = 0.010,
+    ascent_target_depth::Real = -10.0,
+    max_ascent_duration::Real = 86400.0,
+    max_current_speed::Union{Nothing, Real} = 3.0,
+    cv_molt::Real = 0.0,
+    cv_mortality::Real = 0.0,
+    cv_settlement::Real = 0.0,
+    stokes_fn::Union{Nothing, Function} = nothing,
+    stokes_decay_depth::Real = 10.0,
+    rng::AbstractRNG = Random.default_rng()
+)
+    n_particles = length(larvae.lon)
+    n_steps = Int(floor(total_duration / dt)) + 1
+    times = range(0.0, total_duration, length = n_steps)
+    dt_days = dt / 86400.0
+
+    traj_lon = Matrix{Float64}(undef, n_particles, n_steps)
+    traj_lat = Matrix{Float64}(undef, n_particles, n_steps)
+    traj_depth = Matrix{Float64}(undef, n_particles, n_steps)
+    traj_temp = Matrix{Float64}(undef, n_particles, n_steps)
+    traj_dd = Matrix{Float64}(undef, n_particles, n_steps)
+    traj_surv = Matrix{Float64}(undef, n_particles, n_steps)
+    traj_stage = Matrix{Symbol}(undef, n_particles, n_steps)
+
+    current_degree_days = hasproperty(larvae, :degree_days) ?
+                          copy(larvae.degree_days) : zeros(Float64, n_particles)
+    current_alive = hasproperty(larvae, :alive) ?
+                    copy(larvae.alive) : fill(true, n_particles)
+    current_settlement = hasproperty(larvae, :settlement_status) ?
+                         copy(larvae.settlement_status) : fill(:pelagic, n_particles)
+    current_settlement_age = fill(Float64(total_duration), n_particles)
+    competence_onset_step  = fill(-1, n_particles)
+    t_bed_filtered = zeros(Float64, n_particles)
+    # Number of steps actually integrated. The loop stops early once every larva has terminated
+    # (settled or dead), and the trajectory matrices are truncated to this many columns so the
+    # caller never sees trailing copies of the final state.
+    steps_done = 1
+    stage_survival = fill(1.0, n_particles)
+    ascent_complete = Vector{Bool}(undef, n_particles)
+    ascent_duration = fill(0.0, n_particles)
+
+    # Global molt schedule: three per-stage threshold CDFs, built ONCE before the time loop.
+    molt_sched = molt_schedule(dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
+                               dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
+                               dd_megalopa_to_settle = dd_megalopa_to_settle,
+                               cv_molt = cv_molt)
+
+    # Three PERSISTENT per-larva traits, each a single Uniform(0,1) quantile drawn ONCE here and
+    # held for the larva's whole life. These are individual qualities, not per-step noise:
+    #   developmental_u  - fast vs slow developer (reused across all three stage transitions, so a
+    #                      fast developer stays a fast developer)
+    #   vigour_u         - weakness vs vigour; scales the mortality rate via a lognormal frailty
+    #   settlement_u     - how readily the larva settles; perturbs the site HSI
+    # Redrawing any of these inside the time loop would resample the individual each step, which
+    # was the original stage-regression bug.
+    developmental_u = rand(rng, n_particles)
+    vigour_u        = rand(rng, n_particles)
+    settlement_u    = rand(rng, n_particles)
+
+    # Mortality frailty multiplier per larva (mean 1, CV cv_mortality), fixed for life.
+    frailty = [frailty_from_quantile(vigour_u[p], cv_mortality) for p in 1:n_particles]
+
+    # Cohort-level molt fraction per step, from the cohort MEAN degree-days: the direct 0-to-1
+    # readout of how much of the cohort has completed each transition.
+    cohort_molt = Matrix{Float64}(undef, 3, n_steps)
+
+    # Set initial states at t = 0
+    traj_lon[:, 1] = copy(larvae.lon)
+    traj_lat[:, 1] = copy(larvae.lat)
+    traj_depth[:, 1] = copy(larvae.depth)
+    traj_stage[:, 1] = copy(larvae.stage)
+    traj_dd[:, 1] = copy(current_degree_days)
+    traj_surv[:, 1] .= 1.0
+
+    for p in 1:n_particles
+        # Particles already at or above surface target have completed initial ascent
+        ascent_complete[p] = !enable_initial_ascent || (traj_depth[p, 1] >= ascent_target_depth)
+    end
+
+    for p in 1:n_particles
+        init_T = isnothing(temperature_fn) ? Float64(default_temperature) :
+                 temperature_fn(traj_lon[p, 1], traj_lat[p, 1], traj_depth[p, 1], 0.0)
+        traj_temp[p, 1] = init_T
+        init_bed = isnothing(bathymetry_fn) ? Float64(default_bottom_depth) :
+                   bathymetry_fn(traj_lon[p, 1], traj_lat[p, 1])
+        t_bed_filtered[p] = isnothing(temperature_fn) ? Float64(default_temperature) :
+                            temperature_fn(traj_lon[p, 1], traj_lat[p, 1], init_bed, 0.0)
+    end
+
+    # Initialise cohort_molt column 1 explicitly. The matrix is `undef`, and the loop only writes
+    # column `s+1`, so leaving column 1 untouched would ship uninitialised memory as a reported
+    # cohort fraction.
+    if enable_molting
+        dd0 = sum(current_degree_days) / n_particles
+        cohort_molt[:, 1] .= cohort_molt_fraction(molt_sched, dd0)
+    end
+
+    for s in 1:(n_steps - 1)
+        t_current = times[s]
+        # Every larva has terminated: nothing further can change, so stop and truncate rather
+        # than integrating the remaining steps for a cohort that is entirely dead or settled.
+        all(!, current_alive) && break
+        for p in 1:n_particles
+            if !current_alive[p]
+                traj_lon[p, s + 1] = traj_lon[p, s]
+                traj_lat[p, s + 1] = traj_lat[p, s]
+                traj_depth[p, s + 1] = traj_depth[p, s]
+                traj_temp[p, s + 1] = traj_temp[p, s]
+                traj_dd[p, s + 1] = traj_dd[p, s]
+                traj_surv[p, s + 1] = 0.0
+                traj_stage[p, s + 1] = traj_stage[p, s]
+                continue
+            end
+
+            cur_lon = traj_lon[p, s]
+            cur_lat = traj_lat[p, s]
+            cur_depth = traj_depth[p, s]
+            cur_stage = traj_stage[p, s]
+
+            # Query background velocity
+            u, v, w = velocity_fn(cur_lon, cur_lat, cur_depth, t_current)
+            if enable_tides
+                u, v = superpose_tidal_velocity(
+                    u, v, t_current,
+                    u_amp = tidal_u_amp,
+                    v_amp = tidal_v_amp,
+                    period = tidal_period,
+                    phase = tidal_phase,
+                    constituents = tidal_constituents,
+                    u_amplitudes = tidal_u_amplitudes,
+                    v_amplitudes = tidal_v_amplitudes,
+                    phases = tidal_phases
+                )
+            end
+
+            # Query temperature and seabed depth
+            cur_T = isnothing(temperature_fn) ? Float64(default_temperature) :
+                    temperature_fn(cur_lon, cur_lat, cur_depth, t_current)
+            z_bed = isnothing(bathymetry_fn) ? Float64(default_bottom_depth) :
+                    bathymetry_fn(cur_lon, cur_lat)
+            cur_bed_T = isnothing(temperature_fn) ? Float64(default_temperature) :
+                        temperature_fn(cur_lon, cur_lat, z_bed, t_current)
+
+            # Filter high-frequency semi-diurnal M2 tidal temperature oscillations (tau ≈ 12.42 h = 44712 s)
+            alpha_tidal = clamp(dt / 44712.0, 0.005, 1.0)
+            t_bed_filtered[p] = (1.0 - alpha_tidal) * t_bed_filtered[p] + alpha_tidal * cur_bed_T
+
+            # Stage-specific mortality scaling (Zoea I fragile, Megalopa robust)
+            stage_mort_factor = cur_stage == :zoea1 ? 1.1 : (cur_stage == :zoea2 ? 1.0 : 0.8)
+            mort_rate = larval_thermal_mortality_rate(
+                cur_T,
+                base_mortality       = mortality_base * stage_mort_factor,
+                thermal_threshold    = mortality_thermal_threshold,
+                thermal_sensitivity  = mortality_thermal_sensitivity,
+                cold_threshold       = mortality_cold_threshold,
+                cold_sensitivity     = mortality_cold_sensitivity
+            )
+            # Mortality. The two modes are mutually exclusive: applying both would double-count,
+            # because the mean-field decay would remove survival that the Bernoulli draw removes
+            # a second time.
+            if cv_mortality > 0.0 && current_alive[p]
+                # Individual mortality rate = the cohort rate scaled by this larva's FIXED lognormal
+                # frailty multiplier (mean 1, CV cv_mortality). Because the multiplier is drawn once
+                # and held for life, a weak larva faces a raised rate throughout rather than being
+                # re-randomised every step -- the unobserved-heterogeneity (frailty) formulation of
+                # individual survival. `traj_surv` holds its previous value until death, so the
+                # recorded survival is an outcome rather than an expectation.
+                individual_mort_rate = mort_rate * frailty[p]
+                p_survive = exp(-individual_mort_rate * dt_days)
+                if rand(rng) > p_survive
+                    current_alive[p] = false
+                    cur_stage = :dead
+                    traj_surv[p, s + 1] = 0.0
+                else
+                    traj_surv[p, s + 1] = traj_surv[p, s]
+                end
+            else
+                # Mean-field: survival reported as an expected fraction, no independent draws.
+                traj_surv[p, s + 1] = max(0.0, traj_surv[p, s] * exp(-mort_rate * dt_days))
+            end
+
+            traj_temp[p, s + 1] = cur_T
+
+            if enable_molting && cur_stage != :instar1_settled
+                current_degree_days[p] += max(0.0, cur_T - t_base) * dt_days
+                new_stage = update_larval_stage(
+                    cur_stage,
+                    current_degree_days[p],
+                    molt_sched,
+                    developmental_u[p]
+                )
+
+                if new_stage != cur_stage
+                    # Record survival fraction across stage molt
+                    stage_survival[p] = traj_surv[p, s + 1]
+                end
+
+                # Settlement evaluation for competent larvae
+                # Competence uses this larva's own megalopa->settle quantile, so it stays
+                # consistent with the stage assigned just above.
+                is_competent = (new_stage == :instar1_settled) ||
+                               (cur_stage == :megalopa &&
+                                developmental_u[p] <= molt_probability(molt_sched[3], current_degree_days[p]))
+
+                if is_competent
+                    if competence_onset_step[p] < 0
+                        competence_onset_step[p] = s
+                    end
+                    days_competent = (s - competence_onset_step[p]) * dt_days
+
+                    # Evaluate settlement suitability against tidally filtered benthic temperature
+                    # Compute the site HSI and its hard gate only. The stochastic acceptance is
+                    # applied here rather than inside the evaluator, because the per-larva
+                    # propensity is a *fixed trait*: passing cv_settlement through would draw a
+                    # fresh Beta perturbation at every candidate site and then compound it with
+                    # this larva's own dispersion, applying the same variance twice and lowering
+                    # the expected settlement rate.
+                    suit = evaluate_settlement_suitability(
+                        z_bed,
+                        t_bed_filtered[p],
+                        min_depth = settlement_min_depth,
+                        max_depth = settlement_max_depth,
+                        max_bottom_temp = settlement_max_temp,
+                        stochastic = false,
+                        cv_settlement = 0.0,
+                        rng = rng
+                    )
+
+                    if suit.suitable && settlement_stochastic
+                        # One perturbation, one draw: this larva's persistent settlement
+                        # readiness applied to the site HSI.
+                        p_accept = settlement_propensity(settlement_u[p], suit.hsi, cv_settlement)
+                        suit = merge(suit, (probability = p_accept,
+                                            suitable = rand(rng) <= p_accept))
+                    end
+
+                    if suit.suitable
+                        current_settlement[p] = :settled_successful
+                        current_settlement_age[p] = t_current
+                        cur_stage = :instar1_settled
+                    elseif days_competent > competence_window_days
+                        # Competence search window expired without reaching nursery habitat
+                        current_settlement[p] = :settled_unsuitable
+                        current_settlement_age[p] = t_current
+                        current_alive[p] = false
+                        cur_stage = :megalopa
+                    else
+                        # Delay settlement: competent larva continues pelagic search phase
+                        current_settlement[p] = :pelagic
+                        cur_stage = :megalopa
+                    end
+                else
+                    cur_stage = new_stage
+                end
+            end
+            traj_dd[p, s + 1] = current_degree_days[p]
+
+            # Depth-dependent vertical diffusivity and Visser (1997) gradient drift
+            local_kv = if !isnothing(κ_v_profile)
+                Float64(κ_v_profile(cur_depth))
+            else
+                Float64(κ_v)
+            end
+            kv_grad = if !isnothing(κ_v_profile)
+                δz = 0.5
+                (Float64(κ_v_profile(cur_depth + δz)) - Float64(κ_v_profile(cur_depth - δz))) / (2.0 * δz)
+            else
+                0.0
+            end
+
+            is_ascending = enable_initial_ascent && !ascent_complete[p]
+
+            # Stokes drift from surface waves if wave forcing is active
+            u_stk, v_stk = if !isnothing(stokes_fn)
+                stk_val = stokes_fn(cur_lon, cur_lat, t_current)
+                (Float64(stk_val[1]), Float64(stk_val[2]))
+            else
+                (0.0, 0.0)
+            end
+
+            # Step Lagrangian transport with BBL shear, sinking, wave Stokes drift, and diffusive drift
+            new_lon, new_lat, new_depth = larval_transport_step(
+                cur_lon, cur_lat, cur_depth,
+                u, v, w, κ_h, local_kv, dt,
+                t = t_current, stage = cur_stage,
+                z_bottom = z_bed,
+                is_lat_lon = is_lat_lon,
+                coastline = coastline,
+                max_current_speed = max_current_speed,
+                enable_bbl = enable_bbl,
+                h_bbl = h_bbl,
+                z0 = z0,
+                enable_sinking = enable_sinking,
+                zoea1_sink = zoea1_sink,
+                zoea2_sink = zoea2_sink,
+                megalopa_sink = megalopa_sink,
+                κ_v_gradient = kv_grad,
+                is_ascending = is_ascending,
+                ascent_speed = ascent_speed,
+                surface_target = ascent_target_depth,
+                u_stokes = u_stk,
+                v_stokes = v_stk,
+                stokes_decay_depth = stokes_decay_depth,
+                rng = rng
+            )
+
+            # Check whether ascending larva reached the surface mixed layer
+            if is_ascending
+                if new_depth >= (ascent_target_depth - 0.5) || (t_current + dt) >= max_ascent_duration
+                    ascent_complete[p] = true
+                    ascent_duration[p] = t_current + dt
+                end
+            end
+
+            # Coastal landmass boundary condition: absorbing boundary via polygon ray-casting and bathymetry.
+            on_land = (is_lat_lon && is_point_on_land(new_lon, new_lat, coastline = coastline)) ||
+                      (!isnothing(bathymetry_fn) && bathymetry_fn(new_lon, new_lat) >= 0.0)
+            if on_land
+                new_lon = cur_lon
+                new_lat = cur_lat
+            end
+
+            traj_lon[p, s + 1] = new_lon
+            traj_lat[p, s + 1] = new_lat
+            traj_depth[p, s + 1] = new_depth
+            traj_stage[p, s + 1] = cur_stage
+
+            # Mark as dead when cumulative survival probability falls below threshold
+            if traj_surv[p, s + 1] < min_survival_prob
+                current_alive[p] = false
+            end
+        end
+
+        # Cohort-level molt fraction from the cohort MEAN degree-days: (F1, F2, F3) at this step.
+        # This is the 0-to-1 probability scale the per-larva developmental quantiles are compared
+        # against, reported directly so stage progression can be checked at a glance.
+        if enable_molting
+            dd_mean = sum(view(current_degree_days, 1:n_particles)) / n_particles
+            cohort_molt[:, s + 1] .= cohort_molt_fraction(molt_sched, dd_mean)
+        end
+        steps_done = s + 1
+    end
+
+    # Truncate the preallocated matrices to the steps actually integrated. When the cohort
+    # terminated early, columns beyond `steps_done` hold stale values from the initial fill and
+    # would misrepresent the trajectory as continuing to the full `total_duration`.
+    n_out = min(steps_done, n_steps)
+    traj_lon   = traj_lon[:,   1:n_out]
+    traj_lat   = traj_lat[:,   1:n_out]
+    traj_depth = traj_depth[:, 1:n_out]
+    traj_temp  = traj_temp[:,  1:n_out]
+    traj_dd    = traj_dd[:,     1:n_out]
+    traj_surv  = traj_surv[:,   1:n_out]
+    traj_stage = traj_stage[:, 1:n_out]
+    times_used = collect(times[1:n_out])
+    cohort_molt_out = cohort_molt[:, 1:n_out]
+
+    return (
+        lons = traj_lon,
+        lats = traj_lat,
+        depths = traj_depth,
+        temperatures = traj_temp,
+        degree_days = current_degree_days,
+        degree_days_timeseries = traj_dd,
+        survival_probability = traj_surv,
+        stage_survival = stage_survival,
+        stages = traj_stage,
+        alive = current_alive,
+        settlement_status = current_settlement,
+        settlement_age = current_settlement_age,
+        ascent_duration = ascent_duration,
+        times = times_used,
+        terminated_early = steps_done < n_steps,
+        # Cohort-level probability of having completed each transition, from the cohort mean
+        # degree-days: rows are (:zoea1→:zoea2, :zoea2→:megalopa, :megalopa→:instar1).
+        cohort_molt_fraction = cohort_molt_out,
+        molt_schedule = molt_sched,
+        ids = larvae.id
+    )
+end
+
+"""
+    safe_mean(collection; default::Real = 0.0) -> Float64
+
+Compute the arithmetic mean of a numerical collection safely. If the collection
+is empty or contains only NaN values, returns `default` rather than throwing an
+`ArgumentError` or runtime exception.
+
+# Mathematical Formulation
+```math
+\\bar{x} = \\begin{cases}
+\\frac{1}{N} \\sum_{i=1}^N x_i, & N > 0 \\\\
+x_{\\text{default}}, & N = 0
+\\end{cases}
+```
+
+# Inputs
+- `collection`: Iterable or array of numeric values.
+- `default::Real`: Fallback value returned when collection is empty (default 0.0).
+
+# Outputs
+- `Float64`: Mean value or default fallback.
+"""
+function safe_mean(collection; default::Real = 0.0)
+    if isempty(collection)
+        return Float64(default)
+    end
+    valid_vals = [Float64(x) for x in collection if !isnan(x)]
+    if isempty(valid_vals)
+        return Float64(default)
+    end
+    return mean(valid_vals)
+end
+
+"""
+    canonicalize_trajectories(trajectories::NamedTuple) -> NamedTuple
+
+Normalize and validate a Lagrangian trajectory dataset to guarantee uniform array
+dimensions, consistent canonical Symbol types for stages and statuses, and complete
+fields required for Zarr storage, spatial analysis, and interactive visualization.
+
+# Canonical Types & Array Specifications
+- `lons::Matrix{Float64}`: 2D array of longitudes `(n_particles, n_times)`.
+- `lats::Matrix{Float64}`: 2D array of latitudes `(n_particles, n_times)`.
+- `depths::Matrix{Float64}`: 2D array of depths in meters `(n_particles, n_times)`.
+- `times::Vector{Float64}`: 1D array of timestamps in seconds `(n_times,)`.
+- `stages::Matrix{Symbol}`: 2D array of canonical stage symbols `(n_particles, n_times)`
+  (e.g., `:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`, `:dead`).
+- `alive::Vector{Bool}`: 1D boolean array indicating final alive state `(n_particles,)`.
+- `settlement_status::Vector{Symbol}`: 1D canonical symbols `(n_particles,)`
+  (e.g., `:pelagic`, `:settled_successful`, `:settled_unsuitable`).
+- `settlement_age::Vector{Float64}`: 1D array of settlement ages in seconds `(n_particles,)`.
+- `degree_days::Vector{Float64}`: 1D cumulative degree-days per particle `(n_particles,)`.
+- `degree_days_timeseries::Matrix{Float64}`: 2D degree-days timeseries `(n_particles, n_times)`.
+- `temperatures::Matrix{Float64}`: 2D water temperatures in °C `(n_particles, n_times)`.
+- `survival_probability::Matrix{Float64}`: 2D survival rates in `[0, 1]` `(n_particles, n_times)`.
+- `ids::Vector{Int}`: 1D unique particle identifiers `(n_particles,)`.
+
+# Inputs
+- `trajectories::NamedTuple`: Raw or partially constructed trajectory record.
+
+# Outputs
+- `NamedTuple`: Fully normalized trajectory record with guaranteed schema.
+"""
+function canonicalize_trajectories(trajectories::NamedTuple)
+    if !hasproperty(trajectories, :lons) || !hasproperty(trajectories, :lats)
+        error("Trajectory structure must contain :lons and :lats coordinates.")
+    end
+
+    raw_lons = trajectories.lons
+    raw_lats = trajectories.lats
+
+    n_p, n_t = if ndims(raw_lons) == 2
+        size(raw_lons)
+    elseif ndims(raw_lons) == 1
+        (length(raw_lons), 1)
+    else
+        error("Unsupported :lons dimensionality: $(ndims(raw_lons)). Expected 1D or 2D.")
+    end
+
+    lons = ndims(raw_lons) == 2 ? Float64.(raw_lons) : reshape(Float64.(raw_lons), n_p, 1)
+    lats = ndims(raw_lats) == 2 ? Float64.(raw_lats) : reshape(Float64.(raw_lats), n_p, 1)
+
+    depths = if hasproperty(trajectories, :depths)
+        raw_z = trajectories.depths
+        ndims(raw_z) == 2 ? Float64.(raw_z) : reshape(Float64.(raw_z), n_p, n_t)
+    else
+        fill(0.0, n_p, n_t)
+    end
+
+    times = if hasproperty(trajectories, :times)
+        Float64.(collect(trajectories.times))
+    else
+        collect(range(0.0, step = 300.0, length = n_t))
+    end
+
+    ids = if hasproperty(trajectories, :ids)
+        Int.(collect(trajectories.ids))
+    elseif hasproperty(trajectories, :id)
+        Int.(collect(trajectories.id))
+    else
+        collect(1:n_p)
+    end
+
+    alive = if hasproperty(trajectories, :alive)
+        raw_a = trajectories.alive
+        if length(raw_a) == n_p
+            Bool.(collect(raw_a))
+        else
+            fill(true, n_p)
+        end
+    else
+        fill(true, n_p)
+    end
+
+    # Normalize settlement_status to canonical Vector{Symbol}
+    settle_syms = if hasproperty(trajectories, :settlement_status)
+        raw_s = trajectories.settlement_status
+        [Symbol(lowercase(string(s))) for s in raw_s]
+    else
+        fill(:pelagic, n_p)
+    end
+
+    settlement_age = if hasproperty(trajectories, :settlement_age)
+        Float64.(collect(trajectories.settlement_age))
+    else
+        fill(times[end], n_p)
+    end
+
+    # Normalize stages to Matrix{Symbol}
+    stages_mat = if hasproperty(trajectories, :stages)
+        raw_st = trajectories.stages
+        if ndims(raw_st) == 2 && size(raw_st) == (n_p, n_t)
+            [Symbol(lowercase(string(raw_st[p, t]))) for p in 1:n_p, t in 1:n_t]
+        elseif length(raw_st) == n_p
+            repeat([Symbol(lowercase(string(s))) for s in raw_st], 1, n_t)
+        else
+            fill(:zoea1, n_p, n_t)
+        end
+    elseif hasproperty(trajectories, :stage)
+        raw_st = trajectories.stage
+        if length(raw_st) == n_p
+            repeat([Symbol(lowercase(string(s))) for s in raw_st], 1, n_t)
+        else
+            fill(:zoea1, n_p, n_t)
+        end
+    else
+        fill(:zoea1, n_p, n_t)
+    end
+
+    # Normalize degree_days to 1D vector and 2D timeseries
+    dd_ts = if hasproperty(trajectories, :degree_days_timeseries) &&
+               ndims(trajectories.degree_days_timeseries) == 2 &&
+               size(trajectories.degree_days_timeseries) == (n_p, n_t)
+        Float64.(trajectories.degree_days_timeseries)
+    elseif hasproperty(trajectories, :degree_days)
+        raw_dd = trajectories.degree_days
+        if ndims(raw_dd) == 2 && size(raw_dd) == (n_p, n_t)
+            Float64.(raw_dd)
+        elseif length(raw_dd) == n_p
+            repeat(reshape(Float64.(raw_dd), n_p, 1), 1, n_t)
+        else
+            fill(0.0, n_p, n_t)
+        end
+    else
+        fill(0.0, n_p, n_t)
+    end
+
+    dd_vec = if hasproperty(trajectories, :degree_days) && length(trajectories.degree_days) == n_p
+        Float64.(collect(trajectories.degree_days))
+    else
+        Float64.(dd_ts[:, end])
+    end
+
+    # Normalize temperatures to 2D matrix
+    temps = if hasproperty(trajectories, :temperatures) &&
+               ndims(trajectories.temperatures) == 2 &&
+               size(trajectories.temperatures) == (n_p, n_t)
+        Float64.(trajectories.temperatures)
+    elseif hasproperty(trajectories, :temperature) && length(trajectories.temperature) == n_p
+        repeat(reshape(Float64.(trajectories.temperature), n_p, 1), 1, n_t)
+    else
+        fill(4.0, n_p, n_t)
+    end
+
+    # Normalize survival_probability to 2D matrix
+    survs = if hasproperty(trajectories, :survival_probability) &&
+               ndims(trajectories.survival_probability) == 2 &&
+               size(trajectories.survival_probability) == (n_p, n_t)
+        Float64.(trajectories.survival_probability)
+    elseif hasproperty(trajectories, :survival_probability) &&
+           length(trajectories.survival_probability) == n_p
+        repeat(reshape(Float64.(trajectories.survival_probability), n_p, 1), 1, n_t)
+    else
+        ones(Float64, n_p, n_t)
+    end
+
+    stage_survs = if hasproperty(trajectories, :stage_survival) &&
+                     length(trajectories.stage_survival) == n_p
+        Float64.(collect(trajectories.stage_survival))
+    else
+        Float64.(survs[:, end])
+    end
+
+    ascent_dur = if hasproperty(trajectories, :ascent_duration) &&
+                    length(trajectories.ascent_duration) == n_p
+        Float64.(collect(trajectories.ascent_duration))
+    else
+        zeros(Float64, n_p)
+    end
+
+    return (
+        lons = lons,
+        lats = lats,
+        depths = depths,
+        times = times,
+        stages = stages_mat,
+        alive = alive,
+        settlement_status = settle_syms,
+        settlement_age = settlement_age,
+        ascent_duration = ascent_dur,
+        degree_days = dd_vec,
+        degree_days_timeseries = dd_ts,
+        temperatures = temps,
+        survival_probability = survs,
+        stage_survival = stage_survs,
+        ids = ids
+    )
+end
+
+"""
+    canonicalize_status(trajectories::NamedTuple) -> NamedTuple
+    canonicalize_status!(trajectories::NamedTuple) -> NamedTuple
+
+Alias for `canonicalize_trajectories` providing in-place or returning normalization of
+status and stage symbols across Lagrangian trajectory records.
+"""
+canonicalize_status(trajectories::NamedTuple) = canonicalize_trajectories(trajectories)
+canonicalize_status!(trajectories::NamedTuple) = canonicalize_trajectories(trajectories)
+
+
+
+# ==========================================================================
+# Stage Thermal Physiology
+#
+# Species-level responses to ambient temperature: temperature-dependent
+# pelagic larval duration and instantaneous thermal mortality. These live with
+# the rest of the larval behaviour model because they are stage biology, not
+# climate forcing; `climate_scenarios.jl` supplies the temperature field that
+# they respond to.
+# ==========================================================================
+
+"""
+    temperature_dependent_pld(
+        temperature_celsius::Real;
+        a::Real = 135.0,
+        b::Real = 0.75,
+        t_ref::Real = 1.0
+    )
+
+Calculate total Pelagic Larval Duration (PLD in days) for snow crab (*Chionoecetes opilio*)
+from egg hatch to benthic settlement as a function of ambient water temperature.
+
+# Mathematical Formulation
+Following empirical rearing models (Sainte-Marie & Sainte-Marie, 1999; Kuhn & Choi, 2011):
+```math
+\\text{PLD}(T) = a \\cdot (T + t_{\\text{ref}})^{-b}
+```
+
+# Inputs
+- `temperature_celsius::Real`: Mean ambient water temperature in °C.
+- `a::Real`: Empirical scaling constant (default 135.0).
+- `b::Real`: Empirical power coefficient (default 0.75).
+- `t_ref::Real`: Temperature offset parameter (default 1.0 °C).
+
+# Outputs
+- `Float64`: Estimated larval drift duration in days.
+
+# References
+- Kuhn, P. S., & Choi, J. S. (2011). Influence of temperature on embryo incubation
+  and larval development in snow crab (*Chionoecetes opilio*).
+  *Fisheries Research*, 107(1-3), 81-87. DOI: 10.1016/j.fishres.2010.10.011
+- Sainte-Marie, G., & Sainte-Marie, B. (1999). Growth, developmental stages, and
+  vertical distribution of snow crab larvae (*Chionoecetes opilio*).
+  *Can. J. Fish. Aquat. Sci.*, 56(11), 2181-2193. DOI: 10.1139/f99-151
+"""
+function temperature_dependent_pld(
+    temperature_celsius::Real;
+    a::Real = 135.0,
+    b::Real = 0.75,
+    t_ref::Real = 1.0,
+    t_base::Real = -1.5
+)
+    # Effective temperature relative to the developmental physiological threshold
+    # (C. opilio larvae develop in the Cold Intermediate Layer down to -1.5°C;
+    # Kuhn & Choi 2011). Preserves physiological slowing without artificial clipping at 0°C.
+    T = Float64(temperature_celsius)
+    t_effective = max(0.05, T - t_base)
+    t_norm = max(0.05, Float64(t_ref) - Float64(t_base))
+    pld_days = a * (t_effective / t_norm)^(-b)
+    return Float64(pld_days)
+end
+
+"""
+    larval_thermal_mortality_rate(
+        temperature_celsius::Real;
+        base_mortality::Real = 0.02,
+        thermal_threshold::Real = 7.0,
+        thermal_sensitivity::Real = 0.35,
+        cold_threshold::Real = -1.5,
+        cold_sensitivity::Real = 0.02
+    )
+
+Compute the instantaneous daily mortality rate \$\\mu(T)\$ (day⁻¹) for snow crab larvae
+accounting for exponential upper warm-water stress and lower cold-water mortality.
+
+# Mathematical Formulation
+```math
+\\mu(T) = \\mu_{\\text{base}} \\exp\\left( \\beta_{\\text{warm}} \\max(0, T - T_{\\text{warm,crit}}) \\right)
+        + \\mu_{\\text{cold}} \\max(0, T_{\\text{cold,crit}} - T)
+```
+
+# Calibration Notes
+- **Warm stress threshold** \$T_{\\text{warm,crit}} = 7.0^\\circ\\text{C}\$: sub-lethal
+  warm-water stress initiates at ≥7°C in *C. opilio* larvae
+  (Kuhn & Choi, 2011; Epifanio & Cohen, 2016). Lethal limit ≈9°C.
+  The exponential form accurately captures rapid thermal mortality during warm anomalies.
+- **Cold stress threshold** \$T_{\\text{cold,crit}} = -1.5^\\circ\\text{C}\$: larvae
+  enter dormancy / diapause below ~-1.5°C (Kuhn & Choi, 2011). Linear
+  penalty applied to avoid discontinuity at the threshold.
+
+# Inputs
+- `temperature_celsius::Real`: Water temperature in °C.
+- `base_mortality::Real`: Baseline natural daily mortality rate (default 0.02 day⁻¹).
+- `thermal_threshold::Real`: Upper warm-stress onset threshold \$T_{\\text{warm,crit}}\$ (default 7.0 °C).
+- `thermal_sensitivity::Real`: Warm-stress exponential coefficient (default 0.35 °C⁻¹).
+- `cold_threshold::Real`: Lower cold-stress onset threshold \$T_{\\text{cold,crit}}\$ (default -1.5 °C).
+- `cold_sensitivity::Real`: Cold-stress linear coefficient (default 0.02 day⁻¹ °C⁻¹).
+
+# Outputs
+- `Float64`: Instantaneous daily mortality rate in \$\\text{day}^{-1}\$.
+
+# References
+- Kuhn, P. S., & Choi, J. S. (2011). *Fisheries Research*, 107(1-3), 81-87.
+  DOI: 10.1016/j.fishres.2010.10.011
+- Epifanio, C. E., & Cohen, J. H. (2016). *JEMBE*, 482, 85-105.
+"""
+function larval_thermal_mortality_rate(
+    temperature_celsius::Real;
+    base_mortality::Real = 0.02,
+    thermal_threshold::Real = 7.0,
+    thermal_sensitivity::Real = 0.35,
+    cold_threshold::Real = -1.5,
+    cold_sensitivity::Real = 0.02
+)
+    T = Float64(temperature_celsius)
+    excess_warm = max(0.0, T - thermal_threshold)
+    excess_cold = max(0.0, cold_threshold - T)
+    mortality = base_mortality * exp(thermal_sensitivity * excess_warm) +
+                cold_sensitivity * excess_cold
+    return Float64(mortality)
+end
