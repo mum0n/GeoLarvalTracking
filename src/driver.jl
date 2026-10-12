@@ -33,6 +33,60 @@ function resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::S
     end
 end
 
+"""
+    build_flow_from_store(store; max_snapshots, span) -> (lon,lat,z,t) -> (u,v,w,T)
+
+The advective field for tracking, read from an already-opened `HydrodynamicStore`. Intervals
+are subsampled (endpoints kept) to at most `max_snapshots` so a long run is not held wholly
+in memory, the retained span is written back through `span`, and the field is bilinear in
+space and linear in time -- the contract `track_larval_cohort` expects of a velocity.
+"""
+function build_flow_from_store(store::HydrodynamicStore;
+                               max_snapshots::Int = typemax(Int),
+                               span::Vector{Float64} = [0.0, 0.0])
+    t = store.times
+    nt = length(t)
+    keep = nt <= max_snapshots ? collect(1:nt) :
+           sort(unique(round.(Int, range(1, stop = nt, length = max(2, max_snapshots)))))
+    tsel = t[keep]
+
+    lon = store.axes.lon; lat = store.axes.lat; z = store.axes.depth
+    fields = ("u", "v", "w", "T")
+    data = Dict{String, Vector{Array{Float64, 3}}}(
+        n => [variable(store, n, k) for k in keep] for n in fields)
+
+    _weight(vals, v) = begin
+        i = something(findfirst(x -> x > v, vals), length(vals))
+        i = clamp(i, 2, max(2, length(vals)))
+        return (i, clamp((v - vals[i-1]) / (vals[i] - vals[i-1]), 0.0, 1.0))
+    end
+    _tw(v) = begin
+        m = clamp(something(findfirst(x -> x > v, tsel), length(tsel)), 2, max(2, length(tsel)))
+        return (m, clamp((v - tsel[m-1]) / (tsel[m] - tsel[m-1]), 0.0, 1.0))
+    end
+
+    span[1] = tsel[1]; span[2] = tsel[end]
+    return function flow_interpolator(lon_q::Real, lat_q::Real, z_q::Real, t_q::Real)
+        i, sx = _weight(lon, Float64(lon_q))
+        j, sy = _weight(lat, Float64(lat_q))
+        k, sz = _weight(z, Float64(z_q))
+        m, θ = _tw(Float64(t_q))
+        sample(name) = begin
+            arr = data[name]
+            a = 0.0
+            for (ar, wf) in ((arr[m-1], 1.0 - θ), (arr[m], θ))
+                a += wf * (
+                    (1-sx)*(1-sy)*(1-sz)*ar[i-1,j-1,k-1] + sx*(1-sy)*(1-sz)*ar[i,j-1,k-1] +
+                    (1-sx)*sy*(1-sz)*ar[i-1,j,k-1]     + sx*sy*(1-sz)*ar[i,j,k-1] +
+                    (1-sx)*(1-sy)*sz*ar[i-1,j-1,k]     + sx*(1-sy)*sz*ar[i,j-1,k] +
+                    (1-sx)*sy*sz*ar[i-1,j,k]           + sx*sy*sz*ar[i,j,k])
+            end
+            return a
+        end
+        return (u = sample("u"), v = sample("v"), w = sample("w"), T = sample("T"))
+    end
+end
+
 
 """
     run_segment_tracking(; opts::HydrodynamicOptions) -> NamedTuple
@@ -47,17 +101,44 @@ benthic settlement filtering.
 # Outputs
 - `NamedTuple`: Trajectories record and summary metrics.
 """
-function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions())
+function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(),
+                              hydro_file::Union{Nothing, AbstractString} = nothing)
     println("\n=================================================================")
     println(" [Segment 6/8] Lagrangian Particle Tracking & Larval Behavior")
     println("=================================================================")
     rng = MersenneTwister(opts.seed)
 
-    # Spawning area: derive from loaded CFA boundaries + user-defined spatial buffer
+    # The realized ocean simulation is a GeoData store, and the coupling between the two
+    # halves is that store's identity -- a path. GeoOceanModelRun.jl prints it as `--hydro-file`,
+    # which the CLI passes here on `opts.hydro_model_file`; nothing else carries it across, and
+    # the ocean half's own configuration is never opened here. Its interior cell centres also
+    # state the domain, so the spawn area and the advective field agree by construction.
+    hydro_span = [0.0, 0.0]
+    # The store identity: the `--hydro-file` path when passed, else the run's default store.
+    location = (hydro_file !== nothing && !isempty(strip(String(hydro_file)))) ?
+        abspath(String(hydro_file)) : resolve_hydro_model_path(opts, "hydrodynamics.zarr")[1]
+    store = try
+        open_hydrodynamics(location)
+    catch err
+        if opts.track_only
+            error("--track-only needs a realized simulation to track through; none is at " *
+                  "$(location) ($(sprint(showerror, err))). Run GeoOceanModelRun.jl --hydro-only " *
+                  "first, or pass --hydro-file=<store>.")
+        end
+        @warn "No GeoData store at $(location) ($(sprint(showerror, err))); " *
+              "the analytical shelf jet will stand in."
+        nothing
+    end
+
+    # Spawning area: the CFA boundaries if present, else the realized simulation's own domain
+    # (its interior cell centres, so larvae are released where the flow is defined), else the
+    # configured domain expanded by the buffer.
     cfa_polys = load_cfa_polygons(opts.input_dir)
     spawn_lon, spawn_lat = if !isempty(cfa_polys)
         env = get_strata_buffered_envelope(cfa_polys, buffer_km = opts.buffer_km)
         (env.lon_range, env.lat_range)
+    elseif !isnothing(store)
+        (extrema(store.axes.lon), extrema(store.axes.lat))
     else
         expand_domain_with_buffer(opts.domain_lon, opts.domain_lat, buffer_km = opts.buffer_km)
     end
@@ -81,63 +162,39 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         rng = rng
     )
 
-    # 4D hydrodynamic and temperature fields: use create_flow_interpolator_from_jld2
-    # if simulation JLD2 archive exists; otherwise use analytical Scotian Shelf background.
-    default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
-    jld2_target_path, _ = resolve_hydro_model_path(opts, default_jld2)
-
-    if opts.track_only && !isfile(jld2_target_path)
-        error("Cannot run in --track-only mode: hydrodynamic model file does not exist: $(jld2_target_path)\n" *
-              "Please run with --hydro-only first or specify an existing file with --hydro-model=<path>.")
-    end
-
-    sim_jld2_candidates = unique([
-        jld2_target_path,
-        joinpath(opts.output_dir, default_jld2),
-        joinpath(opts.output_dir, "simulation_flow.jld2"),
-        joinpath(opts.output_dir, "simulation_$(opts.scenario)_$(opts.projection_year).jld2"),
-        joinpath("outputs", "simulation_flow.jld2")
-    ])
-    sim_jld2_path = findfirst(isfile, sim_jld2_candidates)
-    # Span, in seconds, of the hydrodynamic record the cohort will be advected through. The cohort
-    # is tracked for this whole span and stops early only once every larva is dead or settled, so
-    # the drift is never shorter than the model it is driven by.
-    hydro_span = [0.0, 0.0]
-
-    flow_interpolator = if !isnothing(sim_jld2_path)
-        actual_path = sim_jld2_candidates[sim_jld2_path]
-        println("Loading 4D simulated hydrodynamic fields from $(actual_path)...")
+    # Span, in seconds, of the hydrodynamic record the cohort will be advected through. The
+    # cohort is tracked for this whole span and stops early only once every larva is dead or
+    # settled, so the drift is never shorter than the model it is driven by. `build_flow_from_store`
+    # writes the retained span back through `hydro_span`.
+    flow_interpolator = if !isnothing(store)
+        println("Reading 4D simulated fields from the GeoData store at $(store.location) " *
+                "($(length(store.times)) interval(s))...")
         try
-            # A production run stores thousands of snapshots; materialising all of them as Float64
-            # for u, v, w and T is hundreds of gigabytes and exhausts memory, which previously made
-            # this silently fall through to the analytical jet below -- producing recruitment numbers
-            # from a synthetic flow rather than the simulated one. So: keep the full record's time
-            # span, but bound how many snapshots are held resident via `max_flow_snapshots`
-            # (evenly subsampled, endpoints preserved), and report the retained span back.
-            interp = create_flow_interpolator(actual_path;
-                                                        t_window = nothing,
-                                                        max_snapshots = opts.max_flow_snapshots,
-                                                        time_range_out = hydro_span)
-            println("  retained span: $(round(hydro_span[1], digits=1)) .. " *
-                    "$(round(hydro_span[2], digits=1)) s " *
-                    "($(round((hydro_span[2] - hydro_span[1]) / 86400, digits=2)) days)")
+            # Intervals are held in memory for the run: `track_larval_cohort` samples the field
+            # many times a step, and re-reading a Zarr array per sample turns the step into I/O.
+            # A production run stores thousands of snapshots, so `max_flow_snapshots` bounds how
+            # many are held (evenly subsampled, endpoints kept) rather than silently stalling.
+            interp = build_flow_from_store(store; max_snapshots = opts.max_flow_snapshots, span = hydro_span)
+            println("  retained span: $(round(hydro_span[1], digits = 1)) .. " *
+                    "$(round(hydro_span[2], digits = 1)) s " *
+                    "($(round((hydro_span[2] - hydro_span[1]) / 86400, digits = 2)) days)")
             interp
         catch err
             # Falling back to an analytical current here would silently replace the simulated
             # hydrodynamics with a synthetic jet, turning a memory limit into a wrong scientific
             # result. Make the failure explicit and actionable instead.
             if opts.allow_analytical_fallback
-                @warn "Failed to build the flow interpolator from $(actual_path): " *
+                @warn "Failed to read the flow field from $(location): " *
                       "$(sprint(showerror, err)). Falling back to the analytical jet because " *
                       "allow_analytical_fallback is set -- results will NOT reflect the simulation."
                 nothing
             else
                 error(
-                    "Failed to build the flow interpolator from $(actual_path):\n  " *
+                    "Failed to read the flow field from $(location):\n  " *
                     sprint(showerror, err) * "\n\n" *
                     "Tracking needs the simulated fields; substituting an analytical current would " *
                     "silently change the science. To proceed deliberately with a synthetic flow, " *
-                    "re-run with --allow-analytical-fallback. To reduce memory, lower " *
+                    "re-run in analytic-fallback mode. To reduce memory, lower " *
                     "[hydrodynamics].max_flow_snapshots (currently $(opts.max_flow_snapshots))."
                 )
             end

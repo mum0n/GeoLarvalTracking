@@ -79,6 +79,13 @@ function display_help(io::IO = stdout)
                           the ocean half's configuration is never read here.
       --save-config[=D]    Write the fully-resolved configuration, then exit.
 
+    Two configurations:
+      default       Cape Breton (NENE) demonstration -- small cohort, generic placeholder
+                    biology; run against the keyless ocean default.toml store.
+      snowcrab      Snow Crab production -- 500-particle cohort over the 60-day pelagic
+                    larval duration with snow-crab biology, run against the ocean
+                    scotian_shelf.toml store (GeoOceanModel/configs/scotian_shelf.toml).
+
     There are no per-run override flags. A particle count or a duration belongs in the TOML so
     the value is recorded with the run; a flag for it is a flag whose value nobody writes down,
     and a re-run from the config would not reproduce what the flag did.
@@ -136,7 +143,7 @@ function resolve_config_file(flag::AbstractString)
     isempty(strip(flag)) || return resolve_config_name(String(flag))
     own = joinpath(@__DIR__, "ParticleTracking.toml")
     isfile(own) && return own
-    return joinpath(@__DIR__, "configs", "biology.toml")
+    return joinpath(@__DIR__, "configs", "default.toml")
 end
 
 function main(args::Vector{String})
@@ -179,10 +186,10 @@ function main(args::Vector{String})
 
     if flags["verb"] == "rerun" || flags["verb"] == "force"
         # A rerun reads what the existing store says and skips what it already covers; --force
-        # overwrites instead, so a repeat of an existing run replaces its results. Both take
-        # `opts` only, so the particle count and the duration come from the configuration
-        # rather than from a flag nobody records.
-        trajs = run_segment_tracking(opts = opts)
+        # overwrites instead, so a repeat of an existing run replaces its results. The ocean
+        # store's identity is passed straight through as `hydro_file`, which is the only
+        # coupling with GeoOceanModel and a path, not a configuration.
+        trajs = run_segment_tracking(opts = opts, hydro_file = hydro)
         run_segment_metrics(opts = opts, trajectories = trajs)
     elseif flags["verb"] == "viz"
         render_all_figures(opts = opts)

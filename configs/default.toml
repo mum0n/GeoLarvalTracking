@@ -1,0 +1,95 @@
+# ==============================================================================
+#  GeoLarvalTracking/configs/default.toml — the biology half, Cape Breton demo
+# ==============================================================================
+#
+#  The larval counterpart to ../GeoOceanModel/configs/default.toml: a small,
+#  quick demo over the Cape Breton (NENE) corner of the Scotian Shelf. The ocean
+#  half runs a 3-day, low-resolution, keyless simulation and hands over the store
+#  as `--hydro-file=PATH`; this half tracks larva through that store.
+#
+#  The design uses generic biology parameters as placeholders rather than
+#  species-specific values—perfect for testing that the pipeline works end-to-end,
+#  though not intended for a real larval diffusion study. The domain shape comes
+#  from the store axes (Cape Breton-derived via spawn_lon/spawn_lat), so the config
+#  doesn't duplicate any spatial information. To run: `GeoLarvalTrackingRun.jl
+#  --rerun --hydro-file=../GeoOceanModel/outputs/default/hydrodynamics.zarr`.
+#
+#  Sections: biology, dvm, molting_and_settlement, tessellation — the generic placeholder
+#  biology, scaled down (fewer particles, shorter track, fewer units) to make the demo quick.
+#  The ocean half's settings live in ../GeoOceanModel/configs/ and its domain comes from the
+#  store.
+# ==============================================================================
+
+[biology]
+n_particles = 300
+track_duration_days = 3.0       # match the ocean default's 3-day run
+track_dt_seconds = 300.0
+min_seabed_depth = 20.0         # shallow Scotian Shelf
+diffusivity_h = 10.0
+diffusivity_v = 1.0e-4
+release_depth_mode = "bottom"
+bottom_release_offset = [0.5, 3.0]
+enable_initial_ascent = true
+ascent_speed = 0.010
+ascent_target_depth = -10.0
+buffer_km = 10.0                # small buffer: the ocean domain is already small
+seed = 42
+
+# Retained flow snapshots, and whether an unreadable store may fall back to an
+# analytic jet. The default keeps up to 100 snapshots of the 3-day run in memory
+# (the run writes every 3 h, so ~25 slices) and refuses the synthetic jet unless
+# asked: a fallback would silently replace the whole point of tracking.
+max_flow_snapshots = 100
+allow_analytical_fallback = false
+
+cv_molt = 0.25
+cv_mortality = 0.25
+cv_settlement = 0.25
+settlement_stochastic = true
+
+
+[dvm]
+enable_dvm = true
+zoea1_day_depth = -50.0
+zoea1_night_depth = -10.0
+zoea2_day_depth = -55.0
+zoea2_night_depth = -8.0
+megalopa_day_depth = -120.0
+megalopa_night_depth = -60.0
+zoea2_depth_factor = 1.0
+megalopa_swim_factor = 1.0
+
+
+[molting_and_settlement]
+enable_molting = true
+t_base = -1.5
+dd_zoea1_to_zoea2 = 65.0
+dd_zoea2_to_megalopa = 130.0
+dd_megalopa_to_settle = 200.0
+settlement_min_depth = -350.0
+settlement_max_depth = -50.0
+settlement_max_temp = 6.0
+mortality_base = 0.01
+mortality_thermal_threshold = 15.0
+mortality_thermal_sensitivity = 0.02
+mortality_cold_threshold = 0.0
+mortality_cold_sensitivity = 0.01
+
+
+[tessellation]
+enable_voronoi = true
+n_units = 120                    # small for a quick demo
+core_depth_min = 50.0
+core_depth_max = 350.0
+prob_core = 0.8
+min_res_core_km = 1.5
+shallow_depth_min = 0.0
+shallow_depth_max = 50.0
+prob_shallow = 0.1
+min_res_shallow_km = 5.0
+deep_depth_min = 350.0
+deep_depth_max = 6000.0
+prob_deep = 0.1
+min_res_deep_km = 10.0
+slope_weighting = true
+slope_factor = 15.0
