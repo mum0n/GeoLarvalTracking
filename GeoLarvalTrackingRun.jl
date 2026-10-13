@@ -80,7 +80,7 @@ function display_help(io::IO = stdout)
       --save-config[=D]    Write the fully-resolved configuration, then exit.
 
     Two configurations:
-      default       Cape Breton (NENE) demonstration -- small cohort, generic placeholder
+      default       Cape Breton  demonstration -- small cohort, generic placeholder
                     biology; run against the keyless ocean default.toml store.
       snowcrab      Snow Crab production -- 500-particle cohort over the 60-day pelagic
                     larval duration with snow-crab biology, run against the ocean
@@ -133,31 +133,54 @@ end
 """
     resolve_config_file(flag::AbstractString) -> String
 
-Which configuration this run uses. A name is resolved through the package's own resolver, a path
-is used as given, and an empty flag falls back to this project's own split file.
-
-Unlike GeoOceanModelRun.jl, this one has no shared TOML to fall back to: SPLIT_PLAN.md section
-1 forbids one, so both halves carry their own.
+Which configuration this run uses, as a *path*. An empty flag is this half's own
+`configs/default.toml`; anything else is resolved through `resolve_config_path`.
 """
 function resolve_config_file(flag::AbstractString)
-    isempty(strip(flag)) || return resolve_config_name(String(flag))
-    own = joinpath(@__DIR__, "ParticleTracking.toml")
-    isfile(own) && return own
-    return joinpath(@__DIR__, "configs", "default.toml")
+    isempty(strip(flag)) && return joinpath(@__DIR__, "configs", "default.toml")
+    return resolve_config_path(String(flag))
+end
+
+"""
+    resolve_config_path(flag::AbstractString) -> String
+
+A file path is used directly; a bare name is looked up under this package's `configs/`
+directory. A name that resolves to nothing is an error naming what was tried, rather than a
+fall-back to a default the operator did not choose.
+"""
+function resolve_config_path(flag::AbstractString)::String
+    f = String(flag)
+    isfile(f) && return abspath(f)
+    name = endswith(f, ".toml") ? f : f * ".toml"
+    named = joinpath(@__DIR__, "configs", name)
+    isfile(named) && return named
+    error("Configuration file not found: $(f). Pass a path, or a name under configs/ " *
+          "(for example: default, snowcrab).")
 end
 
 function main(args::Vector{String})
     flags = parse_args(args)
     flags["help"] && return display_help()
-    isnothing(flags["verb"]) && return display_help()
 
+    cfg_file = resolve_config_file(flags["config"])
     opts = try
-        configuration_to_options(load_configuration(resolve_config_file(flags["config"])))
+        configuration_to_options(load_configuration(cfg_file))
     catch err
         println("Configuration error: $(sprint(showerror, err))")
         return display_help()
     end
-    cfg_file = resolve_config_file(flags["config"])
+
+    # --save-config works without a verb, as it does in the ocean half: resolve and save the
+    # fully-resolved configuration, then exit. (A run needs a verb; inspecting the config does
+    # not.)
+    if !isnothing(flags["save_config"])
+        dest = isempty(flags["save_config"]) ? cfg_file : flags["save_config"]
+        save_configuration(options_to_configuration(opts), dest)
+        println("Resolved configuration written to $(dest)")
+        return nothing
+    end
+
+    isnothing(flags["verb"]) && return display_help()
 
     println("="^73)
     println(" GeoLarvalTracking")
@@ -166,13 +189,6 @@ function main(args::Vector{String})
     println(" Config:     $(cfg_file)")
     println(" Hydro file: $(isempty(flags["hydro_file"]) ? "(not given)" : flags["hydro_file"])")
     println("="^73)
-
-    if !isnothing(flags["save_config"])
-        dest = isempty(flags["save_config"]) ? cfg_file : flags["save_config"]
-        save_configuration(options_to_configuration(opts), dest)
-        println("Resolved configuration written to $(dest)")
-        return nothing
-    end
 
     # The one coupling with the ocean half, and it is a path. Everything about the ocean --
     # domain, grid, bathymetry -- comes from that file's metadata, so the ocean half's own

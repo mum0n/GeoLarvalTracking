@@ -39,6 +39,7 @@ const CONFIG_SECTION_DOMAIN = Dict{String, Symbol}(
     "domain"                => SHARED,
     "grid"                  => SHARED,
     "storage"               => SHARED,
+    "directories"           => SHARED,
     "hardware"              => SHARED,
     "visualization"         => SHARED,
     "paths"                 => SHARED,

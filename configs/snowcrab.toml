@@ -104,3 +104,12 @@ prob_deep = 0.1
 min_res_deep_km = 10.0
 slope_weighting = true
 slope_factor = 15.0
+
+
+[directories]
+# The two directories that wire the halves together, both in the shared lakehouse.
+# `ocean_model` is the realized ocean simulation to track through -- here the Scotian
+# Shelf production store this half is the counterpart to. `output_path` is this half's
+# results directory (trajectories, metrics, figures), replacing the local `outputs/`.
+ocean_model = "../lakehouse/GeoOceanModel/scotian_shelf"
+output_path = "../lakehouse/GeoLarvalTracking/snowcrab"

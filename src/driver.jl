@@ -1,23 +1,19 @@
 using Dates
 using Random
 using Statistics
+ 
+"""
+    resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
 
-# `Build` is a local helper of the umbrella driver, imported unqualified by one of the moved
-# functions. It is not this package's, so it is stubbed rather than left to resolve at call time.
-Build(args...; kwargs...) = error("`Build` is a local helper of the umbrella driver, not this " *
-                                  "package's: the extraction carried its docstring without its " *
-                                  "body. Whoever needs it should port it deliberately.")
-    """
-
-resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
-
-Resolve the target hydrodynamic JLD2 output/input path and filename. If `opts.hydro_model_file`
-is specified, it is used directly (or resolved relative to `opts.output_dir` if a bare filename
-is provided). If empty, returns `(joinpath(opts.output_dir, default_filename), default_filename)`.
+Resolve the target realized-simulation store path and name. If `opts.hydro_model_file` is
+specified it is used directly (or resolved relative to `opts.output_dir` when a bare name is
+given); if empty it is `joinpath(opts.output_dir, default_filename)`. The path is normally the
+GeoData store the ocean half hands over as `--hydro-file`, though the name is left generic so
+it also covers a JLD2 file a caller names.
 
 # Inputs
 - `opts::HydrodynamicOptions`: Configuration parameters.
-- `default_filename::String`: Default fallback filename when none is specified.
+- `default_filename::String`: Default fallback name when none is specified.
 
 # Outputs
 - `Tuple{String, String}`: `(full_path, file_basename)`

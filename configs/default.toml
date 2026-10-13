@@ -3,7 +3,7 @@
 # ==============================================================================
 #
 #  The larval counterpart to ../GeoOceanModel/configs/default.toml: a small,
-#  quick demo over the Cape Breton (NENE) corner of the Scotian Shelf. The ocean
+#  quick demo over the Cape Breton  corner of the Scotian Shelf. The ocean
 #  half runs a 3-day, low-resolution, keyless simulation and hands over the store
 #  as `--hydro-file=PATH`; this half tracks larva through that store.
 #
@@ -93,3 +93,12 @@ prob_deep = 0.1
 min_res_deep_km = 10.0
 slope_weighting = true
 slope_factor = 15.0
+
+
+[directories]
+# The two directories that wire the halves together, both in the shared lakehouse.
+# `ocean_model` is the realized ocean simulation to track through (the `--hydro-file`
+# default; a command-line `--hydro-file` still overrides it). `output_path` is this half's
+# results directory -- trajectories, metrics and figures -- replacing the local `outputs/`.
+ocean_model = "../lakehouse/GeoOceanModel/default"
+output_path = "../lakehouse/GeoLarvalTracking/default"

@@ -154,7 +154,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
      anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
-     output_path = String(get_val("storage", "output_path", joinpath("outputs", "particle_tracking.jld2")))
+     # [directories] is the coupling with the ocean half plus this half's output: `ocean_model`
+     # is the realized GeoData store to track through (the `--hydro-file` default), and
+     # `output_path` is this half's results directory in the lakehouse.
+     dirs_output = String(get_val("directories", "output_path", ""))
+     dirs_ocean  = String(get_val("directories", "ocean_model", ""))
+     output_path = String(get_val("storage", "output_path", isempty(dirs_output) ? joinpath("outputs", "default") : dirs_output))
      zarr_path   = String(get_val("storage", "zarr_path", joinpath("outputs", "particle_tracking.zarr")))
      storage_backend = String(get_val("storage", "storage_backend", "zarr"))
      
@@ -171,11 +176,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
      # `resolved_config.toml` and `data_provenance.json` exist to expose. The cost is disk --
      # a dataset is fetched once per scenario rather than once per machine -- and that is the
      # intended trade, because it makes each scenario a self-contained, shareable directory.
-     output_dir = dirname(output_path)
+     output_dir = isempty(dirs_output) ? dirname(output_path) : dirs_output
      input_dir  = joinpath(output_dir, "inputs")
      seed       = Int(get_val("paths", "seed", 42))
 
-     hydro_file = String(get_val("hydrodynamics", "hydro_model_file", ""))
+     hydro_file = String(get_val("directories", "ocean_model",
+                                 get_val("hydrodynamics", "hydro_model_file", "")))
      hydro_only = Bool(get_val("hydrodynamics", "hydro_only", false))
      track_only = Bool(get_val("hydrodynamics", "track_only", false))
     reuse_hydro = Bool(get_val("hydrodynamics", "reuse_hydro", false))
