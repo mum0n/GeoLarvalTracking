@@ -478,7 +478,7 @@ This study provides the first comprehensive biophysical particle tracking model 
 
 ## Appendix
  
-An analytical and empirical review of the parameterizations copied into `MovementAnalysis/todo.md` is provided below, comparing them against the established snow crab (*Chionoecetes opilio*) biological literature (e.g., Sainte-Marie et al. 1999, Lovrich et al. 1995, Incze et al. 1987, Kuhn & Choi 2011, Dionne et al. 2003, Epifanio & Cohen 2016):
+An analytical and empirical review of the parameterizations copied into `GeoMotion/todo.md` is provided below, comparing them against the established snow crab (*Chionoecetes opilio*) biological literature (e.g., Sainte-Marie et al. 1999, Lovrich et al. 1995, Incze et al. 1987, Kuhn & Choi 2011, Dionne et al. 2003, Epifanio & Cohen 2016):
 
 ---
 
