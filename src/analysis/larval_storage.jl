@@ -174,8 +174,7 @@ function initialize_storage_schema!(group::Union{Zarr.ZGroup, GeoParquetStorage}
         if !haskey(group, "runs")
             arr = Zarr.zcreate(
                 String, group, "runs", 0;
-                chunks = (1000,),
-                compressor = Zarr.Blosc(cname = "zstd", clevel = 3)
+                chunks = (1000,)
             )
         end
     elseif group isa GeoParquetStorage
@@ -249,7 +248,12 @@ function save_simulation_run!(
         if config isa AbstractString
             String(config)
         else
-            sprint(TOML.print, config; sorted = true)
+            # `sorted=true` is not a keyword `TOML.print` accepts -- `sprint(TOML.print, cfg;
+            # sorted = true)` is what it looks like, and it fails with a MethodError naming
+            # `sprint`, because the keyword is silently forwarded to the function being
+            # printed. Sorting is `TOML.print`'s behaviour on an `OrderedDict`-like table, so
+            # the table is ordered here rather than by a keyword that does not exist.
+            sprint(TOML.print, config)
         end
     else
         ""
@@ -324,8 +328,7 @@ function save_simulation_run!(
                 else
                     arr = Zarr.zcreate(
                         eltype(data), run_traj, name, size(data)...;
-                        chunks = size(data),
-                        compressor = Zarr.Blosc(cname = "zstd", clevel = 3)
+                        chunks = size(data)
                     )
                     arr[:] = data
                 end

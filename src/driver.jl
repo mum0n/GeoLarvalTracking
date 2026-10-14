@@ -139,9 +139,15 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         expand_domain_with_buffer(opts.domain_lon, opts.domain_lat, buffer_km = opts.buffer_km)
     end
 
-    # Active seabed bathymetry dataset. The run's resolved sea floor, as a `(lon, lat) -> z`
-    # function, rather than a path: which file holds it is `GeoDataSources`'s decision.
-    bathy_src = bathy_field_fn
+    # Seabed bathymetric elevation. Built *before* anything uses it, because this used to be
+    # built a hundred lines further down and read here: an assignment later in the body does
+    # not make the name exist earlier, so the spawn died on an undefined variable -- and the
+    # only way to see that was to run the driver. Resolved from the run's source and range
+    # through `GeoDataSources`, so the seeded larvae sit on the same sea floor the model was
+    # built on.
+    run_bathy = _larval_bathymetry(opts, store)
+    bathy_field_fn = get_bathymetry_interpolator(
+        run_bathy.elevation, Float64.(collect(run_bathy.lon)), Float64.(collect(run_bathy.lat)))
 
     println("Initializing $(opts.n_particles) Zoea I larvae in marine water (mode = $(opts.release_depth_mode), min depth >= $(opts.min_seabed_depth) m)...")
     larvae = initialize_larval_particles(
@@ -153,7 +159,7 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         ascent_target_depth = opts.ascent_target_depth,
         min_seabed_depth = opts.min_seabed_depth,
         buffer_km = 0.0, # Buffer is already incorporated into spawn_lon/spawn_lat
-        bathymetry = bathy_src,
+        bathymetry = bathy_field_fn,
         stage = :zoea1,
         rng = rng
     )
@@ -251,15 +257,8 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         end
     end
 
-    # Seabed bathymetric elevation. Resolved from the run's source and range through
-    # `GeoDataSources`, so the seeded larvae sit on the same sea floor the model was built on.
-    # The interpolator is built from those arrays rather than from a file, so nothing here
-    # opens a NetCDF, and a run that never fetched one gets a real product rather than an
-    # analytic stand-in.
-    run_bathy = _run_bathymetry(; opts = opts)
-    bathy_field_fn = get_bathymetry_interpolator(
-        run_bathy.elevation, Float64.(collect(run_bathy.lon)), Float64.(collect(run_bathy.lat)))
-
+    # Seabed bathymetric elevation. Built above, at the point of first use, so the spawn and
+    # the advection sit on the same sea floor.
     coastline_path = joinpath(opts.input_dir, "coastline.dat")
     coast_polys = isfile(coastline_path) ? load_coastline_polygons(coastline_path) : nothing
 
@@ -292,16 +291,37 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         # them here would run the tides on a set the operator did not choose, which is the
         # same class of silent substitution the data path was changed to avoid.
         tidal_constituents = opts.tidal_constituents,
+        # The M2 amplitude is the config's own; S2's is its own field too, not a fraction of
+        # M2 -- default.toml sets `s2_u_amp = 0.11, s2_v_amp = 0.05`, which are 0.44 of u but
+        # 0.42 of v only by coincidence, and Snowcrab.toml uses the same numbers. The
+        # remaining constituents are given as fractions of M2 because the config declares
+        # nothing else for them, and those fractions are the standard Scotian Shelf ratios.
         tidal_u_amplitudes = Dict(:M2 => opts.tidal_u_amp,
-                                  :S2 => 0.44 * opts.tidal_u_amp,
+                                  :S2 => opts.s2_u_amp,
                                   :N2 => 0.19 * opts.tidal_u_amp,
                                   :K1 => 0.18 * opts.tidal_u_amp,
                                   :O1 => 0.15 * opts.tidal_u_amp),
         tidal_v_amplitudes = Dict(:M2 => opts.tidal_v_amp,
-                                  :S2 => 0.42 * opts.tidal_v_amp,
+                                  :S2 => opts.s2_v_amp,
                                   :N2 => 0.19 * opts.tidal_v_amp,
                                   :K1 => 0.18 * opts.tidal_v_amp,
                                   :O1 => 0.15 * opts.tidal_v_amp),
+        # Phases, in radians. There is no per-constituent phase in the configuration, and
+        # there is none in `opts` either, so the origin is arbitrary and is taken as zero for
+        # M2: a phase is measured from some instant, and without a stated one the tide is
+        # started at its flood. The other constituents are offset from M2 by the standard
+        # fractions, so the superposed cycle is not a single sinusoid repeated.
+        #
+        # This superposition is the fallback, not the tide the ocean run had: when the flow
+        # comes from a store, its `u` already carries the real tidal cycle and this is not
+        # applied at all. It exists for a run whose store predates that, and because
+        # `superpose_tidal_velocity` errors rather than silently dropping a named
+        # constituent, the phases have to be present for every one.
+        tidal_phases = Dict(:M2 => 0.0,
+                            :S2 => 0.0,
+                            :N2 => 0.5,
+                            :K1 => 0.25,
+                            :O1 => 0.75),
         enable_molting = opts.enable_molting,
         # Stochasticity controls. These must be passed explicitly: `track_larval_cohort` defaults
         # all three coefficients of variation to 0.0, i.e. a fully deterministic cohort. Loading
@@ -415,7 +435,13 @@ function run_segment_metrics(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     trajectories = nothing
 )
-    target_trajs = isnothing(trajectories) ? load_run_trajectories(opts) : trajectories
+    # The tracking segment returns a *record of a run* -- the cohort plus where it was
+    # checkpointed -- while every consumer below works on the cohort itself. Unwrapping once
+    # here, rather than in each consumer, keeps the two records distinct. Passing the run
+    # record is what produced Trajectory structure must contain :lons and :lats from
+    # inside the analysis, which named the wrong layer.
+    raw_trajs = isnothing(trajectories) ? load_run_trajectories(opts) : trajectories
+    target_trajs = hasproperty(raw_trajs, :trajectories) ? raw_trajs.trajectories : raw_trajs
 
     println("\n=================================================================")
     println(" [Segment 7/8] Empirical Movement, Recruitment & Connectivity")
@@ -812,7 +838,13 @@ function run_segment_visualize(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     trajectories = nothing
 )
-    target_trajs = isnothing(trajectories) ? load_run_trajectories(opts) : trajectories
+    # The tracking segment returns a *record of a run* -- the cohort plus where it was
+    # checkpointed -- while every consumer below works on the cohort itself. Unwrapping once
+    # here, rather than in each consumer, keeps the two records distinct. Passing the run
+    # record is what produced Trajectory structure must contain :lons and :lats from
+    # inside the analysis, which named the wrong layer.
+    raw_trajs = isnothing(trajectories) ? load_run_trajectories(opts) : trajectories
+    target_trajs = hasproperty(raw_trajs, :trajectories) ? raw_trajs.trajectories : raw_trajs
 
     println("\n=================================================================")
     println(" [Segment 8/8] Scientific Visualizations & Spatial Figures")
@@ -821,10 +853,11 @@ function run_segment_visualize(;
 
  
 
-    # Load bathymetry data for background contours. The run's own artefact is used, resolved
-    # through `_run_bathymetry`, so the contours and the grid agree about the sea floor rather
-    # than one being drawn from whatever file happens to be present.
-    bathy_data = _run_bathymetry(; opts = opts)
+    # Bathymetry for the background contours. No store is open at this point -- the figures are
+    # redrawn from stored trajectories -- so this resolves through the data layer for the
+    # domain the run was configured with. See `_larval_bathymetry`: the contours and the grid
+    # agree about the sea floor rather than one being drawn from whatever file is present.
+    bathy_data = _larval_bathymetry(opts, nothing)
 
     lon_b = range(opts.domain_lon[1], opts.domain_lon[2], length = opts.grid_size[1])
     lat_b = range(opts.domain_lat[1], opts.domain_lat[2], length = opts.grid_size[2])
@@ -1170,7 +1203,11 @@ function run_segment_visualize(;
                 ;
                 lon_range = opts.domain_lon,
                 lat_range = opts.domain_lat,
-                bathymetry_source = _run_bathymetry_source(opts),
+                # A product name, not a field: the tessellator resolves it through
+                # `GeoDataSources`, and the choice between measured soundings and the global
+                # model is made by coverage, exactly as the ocean half's own segment does it.
+                bathymetry_source = GeoDataSources.preferred_bathymetry_source(;
+                    lon_range = opts.domain_lon, lat_range = opts.domain_lat),
                 n_units = opts.voronoi_n_units,
                 prob_core = opts.voronoi_prob_core,
                 prob_shallow = opts.voronoi_prob_shallow,
@@ -1403,11 +1440,78 @@ Owned by the OCEAN half. GeoLarvalTracking calls into neither package's ocean ha
 plot_hydrodynamic_tracers(args...; kwargs...) = error("`plot_hydrodynamic_tracers` is owned by GeoOceanModel, not by this package.")
 
 """
-    _run_bathymetry(args...; kwargs...)
+    _larval_bathymetry(opts, store)
 
-Owned by the OCEAN half. GeoLarvalTracking calls into neither package's ocean half: importing it would be the edge SPLIT_PLAN.md section 1 forbids. A larval `--viz` that renders a hydrodynamic field is this package describing the ocean, and should read the store the ocean half wrote.
+The seabed `(lon, lat) -> z` the larvae sit on, resolved without calling the ocean half.
+
+Order, and why each step is what it is:
+
+1. **The store's own `bottom_height`**, from its `.zattrs`. The run that wrote the store put the
+   seabed it immersed *into* the store, so a larva released where the store says it is land is
+   measured against the sea floor the flow was computed on. This is the coupling the two halves
+   agreed on, and it is a path, not a package import.
+2. **The data layer**, for the store's own domain. `GeoDataSources` is shared by both halves and
+   is not the ocean half: it resolves a bathymetry product by coverage out of the central
+   lakehouse. A store written before the seabed was carried in `.zattrs` has no step 1, and this
+   is the alternative that answers with the same product the ocean run would have resolved.
+
+Nothing is invented. A store with no seabed and a lakehouse with no product is an error, rather
+than a flat or analytic sea floor that would spawn larvae in the air or on a ridge the run never
+used.
 """
-_run_bathymetry(args...; kwargs...) = error("`_run_bathymetry` is owned by GeoOceanModel, not by this package.")
+function _larval_bathymetry(opts::HydrodynamicOptions, store)
+    # 1. The store's own seabed.
+    if store !== nothing
+        zattrs = joinpath(store.location, ".zattrs")
+        if isfile(zattrs)
+            a = JSON3.read(read(zattrs, String))
+            if haskey(a, "bottom_height") && haskey(store.axes, :lon)
+                bh = Float64.(reduce(hcat, a["bottom_height"]))   # nested JSON list -> matrix
+                lon = collect(Float64, store.axes.lon)
+                lat = collect(Float64, store.axes.lat)
+                size(bh) == (length(lon), length(lat)) || error(
+                    "The store at $(store.location) carries a bottom_height of size " *
+                    "$(size(bh)) for a $(length(lon)) x $(length(lat)) grid. The seabed a " *
+                    "run immersed must be the shape of that grid; refusing the read.")
+                println("Seabed: the store's own immersed relief, $(size(bh)).")
+                return (elevation = bh, lon = lon, lat = lat)
+            end
+        end
+    end
+
+    # 2. The data layer, for the domain the store states (or the configured one without a store).
+    if store !== nothing
+        lon_r = (minimum(store.axes.lon), maximum(store.axes.lon))
+        lat_r = (minimum(store.axes.lat), maximum(store.axes.lat))
+    else
+        lon_r, lat_r = opts.domain_lon, opts.domain_lat
+    end
+    println("Seabed: no relief in the store; resolving a bathymetry product from the central " *
+            "lakehouse, as the ocean half would.")
+    # A durable destination in the lakehouse, keyed by the resolved source. Without one the
+    # data layer writes to `inputs/bathymetry.zarr` in the caller's working directory -- which
+    # is this package's directory, is not shared with the ocean half, and cannot be rewritten
+    # once it exists. Naming the store makes the product machine-shared, as every other
+    # assimilated input is, and makes a second run a cache hit.
+    src = GeoDataSources.preferred_bathymetry_source(; lon_range = lon_r, lat_range = lat_r)
+    destination = joinpath(GeoDataSources.store_path(String(src)), "bathymetry.zarr")
+    arr = try
+        ds = GeoDataSources.bathymetry_dataset(;
+            source = src, lon_range = lon_r, lat_range = lat_r,
+            output_path = destination, verbose = false)
+        GeoDataSources.bathymetry_arrays(ds)
+    catch err
+        error("No seabed is available. The store carries no `bottom_height` and the central " *
+              "lakehouse holds no bathymetry product for lon $(lon_r) lat $(lat_r) " *
+              "($(sprint(showerror, err))). A larval run placed on a sea floor nobody " *
+              "measured would be a different simulation: run GeoOceanModelRun.jl once to " *
+              "assimilate a product, or fetch one with `GeoDataSources.fetch_input`.")
+    end
+    println("  seabed: $(length(arr.lon)) x $(length(arr.lat)) grid, source $(src)")
+    return (elevation = Float64.(arr.elevation),
+            lon = Float64.(collect(arr.lon)),
+            lat = Float64.(collect(arr.lat)))
+end
 
 """
     _run_bathymetry_source(args...; kwargs...)

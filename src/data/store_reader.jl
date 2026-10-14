@@ -4,16 +4,20 @@
 #
 #  Replaces `flow_reader.jl`, which read Oceananigans' JLD2 archive plus a separate grid
 #  sidecar. That reader existed because the archive was the only thing a run produced; now the
-#  run writes its slices into a Zarr store that carries its own coordinates, so a reader opens
-#  one path and gets flow, axes, and times from it.
+#  run writes its slices into a GeoData store that carries its own coordinates, so a reader
+#  opens one path and gets flow, axes, and times from it.
 #
 #  What the store provides (written by `GeoOceanModel.attach_output_callback!`):
 #
-#      hydrodynamics.zarr/
-#        .zattrs          lon, lat, depth, dlon, dlat, fields, title
-#        time.json        the time of each interval, once for the whole store
-#        u/0  u/1  ...    one Zarr array per interval, shaped (n_lon, n_lat, n_depth)
-#        T/0  T/1  ...
+#      hydrodynamics.zarr/          a GeoDataset
+#        .zattrs                    title, created_utc, and the seabed the run immersed
+#        lon, lat, depth, time      coordinate arrays, in the dataset's own `coords`
+#        T, u, v, w                 fields, each (lon, lat, depth, time)
+#
+#  Reading it is `GeoData.geoload(store)`. That is the whole point of the store being a GeoData
+#  store: an earlier writer put each interval in its own directory (`T/0`, `T/1`), which GeoData's
+#  Zarr reader cannot open -- it discovers variables as the root group's child arrays -- so every
+#  consumer walked Zarr itself. This did. Now it does not.
 #
 #  This package does not know how the store was produced. It knows the layout, and that is the
 #  whole coupling between the two packages: `GeoOceanModel` writes it, this package reads it,
@@ -24,8 +28,8 @@
 #  in JLD2, the one format Oceananigans can checkpoint-restart from.
 # ==============================================================================
 
-using Zarr
-using JSON3
+using GeoData
+using GeoData: GeoDataset
 
 """
     _store_path(location) -> String
@@ -47,66 +51,74 @@ end
 """
     _read_times(store) -> Vector{Float64}
 
-The time of each written interval, in order.
+The time of each written interval, in order, from the store's own `time` coordinate.
 
-Read from `time.json`, which the writer updates once per store rather than once per field. One
-place holding the time axis is deliberate: two per-field copies could drift, and a field read
-at its own recorded time but indexed by a shared time axis is a silent mismatch.
+One axis for the whole store is deliberate: a per-field copy could drift, and a field read at
+its own recorded time but indexed by a shared time axis is a silent mismatch. The coordinate
+is read here from a `geoload`ed dataset, so it is the same axis the ocean half wrote.
 """
 function _read_times(store::AbstractString)
-    tf = joinpath(store, "time.json")
-    !isfile(tf) && error(
-        "The store at $(store) has no `time.json`, so the times of its intervals are unknown. " *
-        "A field with no time is not a simulation output.")
-    isempty(tryparse(Float64, "0") ) && error("unreachable")
-    parsed = JSON3.read(read(tf, String))
-    out = Float64[]
-    for v in parsed
-        v isa Vector || (push!(out, Float64(v)); continue)
-        for x in v
-            push!(out, Float64(x))
-        end
-    end
-    isempty(out) && error("`time.json` at $(store) records no times.")
+    ds = _geoload(store)
+    haskey(ds.coords, :time) || error(
+        "The store at $(store) has no `time` coordinate, so the times of its intervals are " *
+        "unknown. A field with no time is not a simulation output.")
+    out = collect(Float64, ds.coords[:time].data)
+    isempty(out) && error("The store at $(store) records no times.")
     return out
 end
 
 """
-    _read_axes(store) -> (; lon, lat, depth, dlon, dlat)
+    _read_axes(store) -> (; lon, lat, depth)
 
-The grid's interior cell centres, read from the store's own `.zattrs`.
+The grid's interior cell centres, from the store's own dimension records.
 
-Absent for a reason that is stated: these are what the sidecar used to carry, in a second file
-next to the archive that nothing kept in step. They are now inside the store, and a store that
-lacks them states which of the two is missing rather than defaulting to a spanned range --
+Present for the reason the sidecar used to be: these are what a reader needs to place a value
+on Earth, and a store that does not state cannot be interpolated against. They come from the
+dataset rather than from a second file that nothing kept in step, and a store that declares
+fewer than three axes errors naming which, rather than defaulting to a spanned range --
 defaulting would put every value in a track at the wrong place.
 """
 function _read_axes(store::AbstractString)
-    zattrs = joinpath(store, ".zattrs")
-    !isfile(zattrs) && error(
-        "The store at $(store) has no `.zattrs`, so its grid coordinates are unknown. A field " *
-        "with no coordinates cannot be interpolated against.")
-    a = JSON3.read(read(zattrs, String))
-    get_vec(k) = [Float64(v) for v in a[k]]
-    get_scalar(k) = Float64(a[k])
-    has = all(haskey(a, k) for k in ("lon", "lat", "depth"))
-    has || error(
-        "The store at $(store) declares $(sort!(collect(keys(a)))) but not lon/lat/depth. " *
-        "A store without its cell centres cannot be read.")
-    return (lon = get_vec("lon"), lat = get_vec("lat"), depth = get_vec("depth"),
-            dlon = get_scalar("dlon"), dlat = get_scalar("dlat"))
+    ds = _geoload(store)
+    out = (lon = nothing, lat = nothing, depth = nothing)
+    for (k, name) in ((:lon, "longitude"), (:lat, "latitude"), (:depth, "depth"))
+        haskey(ds.dims, k) || haskey(ds.dims, Symbol(name)) || error(
+            "The store at $(store) declares $(sort!(collect(keys(ds.dims)))) but not $(k). " *
+            "A store without its cell centres cannot be read.")
+        c = haskey(ds.dims, k) ? collect(Float64, ds.dims[k].coords) :
+                                 collect(Float64, ds.dims[Symbol(name)].coords)
+        out = merge(out, NamedTuple{(k,)}((c,)))
+    end
+    return out
 end
 
 """
     hydrodynamic_variables(store) -> Vector{String}
 
-Which fields the store carries, from `.zattrs`. A reader that asked for a field the store does
-not have would otherwise return zeros and call it a velocity.
+Which fields the store carries. A reader that asked for a field the store does not have would
+otherwise return zeros and call it a velocity.
 """
 function hydrodynamic_variables(store::AbstractString)
-    a = JSON3.read(read(joinpath(store, ".zattrs"), String))
-    haskey(a, "fields") || return [n for n in readdir(store) if isdir(joinpath(store, n))]
-    return [String(v) for v in a["fields"]]
+    return sort!(collect(keys(_geoload(store).variables)))
+end
+
+"""
+    _geoload(store) -> GeoDataset
+
+The store as a GeoData dataset, opened through GeoData.
+
+An empty variable set is an error here rather than at the first read: it is what a store that
+is not GeoData's shape produces -- `geoload` succeeds and finds nothing -- and the failure used
+to surface three call sites later as "does not carry T", naming the wrong layer.
+"""
+function _geoload(store::AbstractString)
+    ds = GeoData.geoload(_store_path(store); backend = :zarr)
+    isempty(ds.variables) && error(
+        "The store at $(store) opens as a GeoData dataset with no variables. Either it is " *
+        "empty, or it was written by an older writer that put each interval in its own " *
+        "directory (`T/0`, `T/1`), which GeoData cannot read. Re-run the simulation to " *
+        "produce a GeoData store.")
+    return ds
 end
 
 """
@@ -118,14 +130,15 @@ Open a realized simulation's store for reading.
 only what it happened to name. A request for a field the store does not have is an error
 listing what it does have.
 
-The result holds no flow arrays. The intervals are read on demand, which is what lets a
+The result holds the opened dataset. The intervals are read on demand, which is what lets a
 consumer hold a long run without holding it in memory.
 """
 function open_hydrodynamics(location::AbstractString; fields = nothing)
     store = _store_path(location)
-    times = _read_times(store)
+    ds = _geoload(store)
+    times = collect(Float64, ds.coords[:time].data)
     axes = _read_axes(store)
-    available = hydrodynamic_variables(store)
+    available = sort!(collect(keys(ds.variables)))
 
     wanted = isnothing(fields) ? available :
              [String(f) for f in (fields isa Union{Tuple, AbstractVector} ? fields : (fields,))]
@@ -133,14 +146,14 @@ function open_hydrodynamics(location::AbstractString; fields = nothing)
     isempty(unknown) || error(
         "The store at $(store) does not carry $(unknown). It carries $(available).")
 
-    return HydrodynamicStore(store, available, times, axes)
+    return HydrodynamicStore(store, available, times, axes, ds)
 end
 
 """
     HydrodynamicStore
 
-A realized simulation's store, opened for reading: its location, its fields, its times, and
-its axes. No flow data.
+A realized simulation's store, opened for reading: its location, its fields, its times, its
+axes, and the dataset they came from. No flow data.
 
 The separation is the point. A consumer is handed a location and reads the interval it needs,
 rather than being handed every interval the run produced.
@@ -150,7 +163,8 @@ struct HydrodynamicStore
     variables::Vector{String}
     times::Vector{Float64}
     axes::@NamedTuple{lon::Vector{Float64}, lat::Vector{Float64},
-                      depth::Vector{Float64}, dlon::Float64, dlat::Float64}
+                      depth::Vector{Float64}}
+    dataset::GeoDataset
 end
 
 """
@@ -158,10 +172,10 @@ end
 
 Interval `m` of one field, as `(n_lon, n_lat, n_depth)`.
 
-Intervals are read from `store/<name>/<m>/`, each a Zarr array with its own `.zarray` metadata.
-An out-of-range index is an error naming the interval count, not a clamped read: a track that
-asked for interval 7 of a 4-interval run is a bug in the track, and returning the last interval
-would hide it behind a plausible velocity.
+Read from the dataset's own array, at `[:, :, :, m]`. An out-of-range index is an error naming
+the interval count, not a clamped read: a track that asked for interval 7 of a 4-interval run
+is a bug in the track, and returning the last interval would hide it behind a plausible
+velocity.
 """
 function variable(store::HydrodynamicStore, name::AbstractString, m::Integer)
     !(name in store.variables) && error(
@@ -169,11 +183,13 @@ function variable(store::HydrodynamicStore, name::AbstractString, m::Integer)
         "$(store.variables).")
     (1 <= m <= length(store.times)) || error(
         "Interval $(m) is out of range: this run wrote $(length(store.times)) interval(s).")
-    dir = joinpath(store.location, name, string(m - 1))
-    !isdir(dir) && error(
-        "Interval $(m) of `$(name)` is declared (time $(store.times[m])) but its directory " *
-        "$(dir) is missing. The store and its time axis disagree.")
-    return collect(Zarr.zopen(dir))
+    v = store.dataset.variables[name]
+    size(v.data, 4) >= m || error(
+        "Interval $(m) is declared by the time axis but field `$(name)` has only " *
+        "$(size(v.data, 4)) interval(s). The store and its time axis disagree.")
+    # Copied to the host rather than returned as a disk-backed view: the interpolator reads
+    # this slice many times per tracking step, and a view is a decompression each time.
+    return Array{Float64}(v.data[:, :, :, m])
 end
 
 """

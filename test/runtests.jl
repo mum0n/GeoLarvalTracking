@@ -16,6 +16,7 @@ reader makes, so reading the real writer's output is what pins the two halves to
 
 using Test
 using GeoLarvalTracking
+using GeoData
 using JSON3
 
 const FIXTURE = normpath(joinpath(@__DIR__, "fixtures", "hydrodynamics.zarr",
@@ -31,8 +32,12 @@ const FIXTURE = normpath(joinpath(@__DIR__, "fixtures", "hydrodynamics.zarr",
         @test length(s.axes.lat) == 4
         @test length(s.axes.depth) == 2
 
-        # The time axis matches the store's own, read back rather than assumed.
-        @test s.times == collect(Float64, JSON3.read(read(joinpath(FIXTURE, "time.json"), String)))
+        # The time axis is the store's own coordinate, read back through GeoData rather than
+        # assumed -- and rather than from a `time.json` sidecar, which the writer no longer
+        # keeps now that the axis lives inside the dataset.
+        local back = GeoData.geoload(FIXTURE; backend = :zarr)
+        @test s.times == collect(Float64, back.coords[:time].data)
+        @test length(s.times) == 3
 
         # A field at an interval is the value written.
         local T0 = GeoLarvalTracking.variable(s, "T", 1)

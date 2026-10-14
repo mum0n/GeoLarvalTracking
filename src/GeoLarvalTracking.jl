@@ -30,6 +30,7 @@ using
 # GeoDataSources supplies the data layer for reading a coastline and for a bathymetry
 # product, which a seed-position filter needs to reject land. Nothing here fetches over the
 # network except through the layer that owns the network.
+using GeoDataSources
 using GeoDataSources: available_data, DataSource
 
 # The provenance registry, as a submodule. The larval half records what it read for its own

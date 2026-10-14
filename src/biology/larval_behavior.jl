@@ -7,6 +7,11 @@ benthic nursery settlement suitability filtering.
 """
 
 using Random
+# `Distributions` supplies the probit and the beta draw: `Normal(0,1)` for the inverse-CDF the
+# frailty and molt quantiles are mapped through, `Beta(α,β)` for the bounded settlement index.
+# Without it the first larval initialisation fails at `Normal(0.0, 1.0)` rather than at the
+# import, which is a long way from the cause.
+using Distributions: quantile, Normal, Beta, cdf, lognormal, LogNormal
 
 # ==============================================================================
 # Stochastic dispersion helpers
@@ -398,6 +403,56 @@ function superpose_tidal_velocity(
         return (Float64(u_mean + u_tide), Float64(v_mean + v_tide))
     end
 end
+
+"""
+    tidal_velocity_vector(t; constituents, u_amplitudes, v_amplitudes, phases) -> (u, v)
+
+The tidal velocity of several constituents at time `t`, as the sum of each one's two
+perpendicular sinusoids, `A·cos(ωt + φ)` and `B·sin(ωt + φ)` with `ω = 2π/period`.
+
+This is the larval half's own part of a tidal cycle. The *tides* themselves -- which
+constituents exist and what their amplitudes are at a coordinate -- belong to the ocean half
+and are read from the store, so this function takes the amplitudes as given and only adds the
+oscillation. The single-constituent case above is the same sum with one term, which is why the
+branch exists: `superpose_tidal_velocity` calls this only when a run names constituents.
+"""
+function tidal_velocity_vector(
+    t::Real;
+    constituents::Vector{Symbol},
+    u_amplitudes::AbstractDict{Symbol, <:Real},
+    v_amplitudes::AbstractDict{Symbol, <:Real},
+    phases::AbstractDict{Symbol, <:Real}
+)
+    u = 0.0
+    v = 0.0
+    for k in constituents
+        haskey(u_amplitudes, k) && haskey(v_amplitudes, k) && haskey(phases, k) || error(
+            "Constituent $(k) is named but its amplitudes and phase are not. A constituent " *
+            "with no amplitude adds nothing, and silently skipping it would produce a current " *
+            "that is not the stated one.")
+        omega = 2.0 * π / TIDAL_PERIODS_S[k]
+        phi = Float64(phases[k])
+        u += Float64(u_amplitudes[k]) * cos(omega * Float64(t) + phi)
+        v += Float64(v_amplitudes[k]) * sin(omega * Float64(t) + phi)
+    end
+    return (u, v)
+end
+
+"""
+    TIDAL_PERIODS_S
+
+The period of each tidal constituent this package superposes, in seconds. Only what the larval
+half needs is listed: these are the constituent periods, which are physics rather than a choice.
+"""
+const TIDAL_PERIODS_S = Dict{Symbol, Float64}(
+    :M2 => 44712.0,
+    :S2 => 43200.0,
+    :N2 => 45570.2,
+    :K2 => 43082.1,
+    :K1 => 86164.1,
+    :O1 => 92949.7,
+    :P1 => 86636.4
+)
 
 """
     bbl_velocity_factor(
