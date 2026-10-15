@@ -324,7 +324,11 @@ function save_simulation_run!(
         )
             if !isnothing(data)
                 if haskey(run_traj, name)
-                    run_traj[name][:] = data
+                    curr_arr = run_traj[name]
+                    if size(curr_arr) != size(data)
+                        Zarr.resize!(curr_arr, size(data)...)
+                    end
+                    curr_arr[:] = data
                 else
                     arr = Zarr.zcreate(
                         eltype(data), run_traj, name, size(data)...;

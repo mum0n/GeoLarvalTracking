@@ -176,6 +176,7 @@ function generate_depth_stratified_voronoi_units(
     slope_factor::Float64 = 15.0,
     lloyd_iterations::Int = 1,
     seed::Int = 42,
+    bathymetry_source::Symbol = :etopo,
     input_dir::AbstractString = joinpath("outputs", "inputs")
 )::VoronoiTessellation
     c_prob = something(core_prob, prob_core, 0.8)
@@ -222,6 +223,8 @@ function generate_depth_stratified_voronoi_units(
         bathymetry
     elseif bathymetry isa GeoDataset
         GeoDataSources.bathymetry_arrays(bathymetry)
+    elseif bathymetry isa Symbol && bathymetry !== :numerical_earth
+        _bathy_grid(bathymetry, lon_range, lat_range)
     else
         _bathy_grid(bathymetry_source, lon_range, lat_range)
     end
@@ -509,6 +512,9 @@ in projected metric coordinates.
 @inline function find_voronoi_cell(tess::VoronoiTessellation, lon::Real, lat::Real)::Int
     x = Float64(lon)
     y = Float64(lat)
+    if !isfinite(x) || !isfinite(y)
+        error("Coordinates must be finite real numbers, received: lon=$(lon), lat=$(lat)")
+    end
     bx = round(Int, x / tess.bin_ddeg)
     by = round(Int, y / tess.bin_ddeg)
 
@@ -638,6 +644,12 @@ function compute_tesselated_connectivity_matrix(
 
         dest_lon = lons[p, end]
         dest_lat = lats[p, end]
+        if !isfinite(dest_lon) || !isfinite(dest_lat)
+            continue
+        end
+        if !isfinite(rel_lon) || !isfinite(rel_lat)
+            continue
+        end
         j = find_voronoi_cell(tess, dest_lon, dest_lat)
 
         counts[i, j] += 1

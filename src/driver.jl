@@ -567,8 +567,13 @@ function run_segment_metrics(;
                     opts;
                     trajectories = target_trajs,
                     metrics = (
-                        mean_exposure_temperature = therm_metrics.mean_exposure_temperature,
-                        mean_degree_days = therm_metrics.mean_degree_days
+                        mean_exposure_temperature = let vals = filter(!isnan, vec(therm_metrics.mean_exposure_temperature))
+                            isempty(vals) ? 0.0 : Statistics.mean(vals)
+                        end,
+                        mean_degree_days = let vals = filter(!isnan, vec(therm_metrics.mean_degree_days))
+                            isempty(vals) ? 0.0 : Statistics.mean(vals)
+                        end,
+                        settlement_success_rate = Float64(rec_metrics.success_rate[1]) # or aggregate
                     ),
                     connectivity = conn,
                     gridded_dispersal = (
@@ -588,23 +593,32 @@ function run_segment_metrics(;
                 )
                 if opts.enable_voronoi && !isnothing(voronoi_res)
                     try
-                        # Zarr doesn't support raw SQL - use the storage API instead
                         if !haskey(db["metrics"], target_run_id)
-                            Zarr.create_group(db["metrics"], target_run_id)
+                            Zarr.zgroup(db["metrics"], target_run_id)
                         end
                         mgroup = db["metrics"][target_run_id]
-                        for u in voronoi_res.units
-                            row_id = u.id
-                            Zarr.write(mgroup["unit_$(row_id)"], Dict(
-                                "run_id" => target_run_id,
-                                "unit_id" => u.id,
-                                "lon" => u.lon,
-                                "lat" => u.lat,
-                                "depth" => u.depth,
-                                "stratum" => string(u.stratum),
-                                "area_km2" => u.area_km2,
-                                "settlement_count" => u.settlement_count,
-                            ))
+                        unit_ids = [u.id for u in voronoi_res.tessellation.units]
+                        lons = [u.lon for u in voronoi_res.tessellation.units]
+                        lats = [u.lat for u in voronoi_res.tessellation.units]
+                        depths = [u.depth for u in voronoi_res.tessellation.units]
+                        strata = [string(u.stratum) for u in voronoi_res.tessellation.units]
+                        areas = [u.area_km2 for u in voronoi_res.tessellation.units]
+                        counts = [u.settlement_count for u in voronoi_res.tessellation.units]
+                        for (aname, adata) in (
+                            "unit_id" => unit_ids,
+                            "lon" => lons,
+                            "lat" => lats,
+                            "depth" => depths,
+                            "stratum" => strata,
+                            "area_km2" => areas,
+                            "settlement_count" => counts
+                        )
+                            if haskey(mgroup, aname)
+                                mgroup[aname][:] = adata
+                            else
+                                arr = Zarr.zcreate(eltype(adata), mgroup, aname, length(adata); chunks=(length(adata),))
+                                arr[:] = adata
+                            end
                         end
                         println("Archived $(length(voronoi_res.units)) Voronoi units to Zarr.")
                     catch v_err

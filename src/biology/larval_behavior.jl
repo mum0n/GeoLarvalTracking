@@ -11,7 +11,7 @@ using Random
 # frailty and molt quantiles are mapped through, `Beta(α,β)` for the bounded settlement index.
 # Without it the first larval initialisation fails at `Normal(0.0, 1.0)` rather than at the
 # import, which is a long way from the cause.
-using Distributions: quantile, Normal, Beta, cdf, lognormal, LogNormal
+using Distributions: quantile, Normal, Beta, cdf, LogNormal
 
 # ==============================================================================
 # Stochastic dispersion helpers
