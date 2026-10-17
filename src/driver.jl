@@ -110,6 +110,16 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
     # the ocean half's own configuration is never opened here. Its interior cell centres also
     # state the domain, so the spawn area and the advective field agree by construction.
     hydro_span = [0.0, 0.0]
+    # When overwrite is requested, purge existing trajectory checkpoints and Zarr store
+    if opts.overwrite
+        tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
+        tagged_cp = joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")
+        default_cp = joinpath(opts.output_dir, "larval_trajectories.jld2")
+        isfile(tagged_cp) && rm(tagged_cp; force = true)
+        isfile(default_cp) && rm(default_cp; force = true)
+        println("Flag --overwrite active: purged existing trajectory checkpoints in $(opts.output_dir)")
+    end
+
     # The store identity: the `--hydro-file` path when passed, else the run's default store.
     location = (hydro_file !== nothing && !isempty(strip(String(hydro_file)))) ?
         abspath(String(hydro_file)) : resolve_hydro_model_path(opts, "hydrodynamics.zarr")[1]
@@ -284,6 +294,9 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         κ_h = opts.diffusivity_h,
         κ_v = opts.diffusivity_v,
         is_lat_lon = true,
+        # Tidal superposition: When reading from a slowly-evolving subsampled store (e.g. 6-hour or daily),
+        # high-frequency tidal velocity is reconstructed analytically: u(x,t) = u_subsampled(x,t) + u_tide(x,t).
+        # This saves 6x to 24x disk storage while preserving tidal excursion fidelity.
         enable_tides = opts.enable_tides,
         tidal_u_amp = opts.tidal_u_amp,
         tidal_v_amp = opts.tidal_v_amp,
@@ -803,7 +816,7 @@ function load_run_trajectories(opts::HydrodynamicOptions)
                joinpath(opts.output_dir, "larval_trajectories.jld2")
 
     from_db = nothing
-    if opts.enable_zarr && isdir(opts.zarr_path)
+    if !opts.overwrite && opts.enable_zarr && isdir(opts.zarr_path)
         db = open_storage(opts.zarr_path; read_only = true)
         try
             println("Loading particle trajectories from Zarr for run '$(target_run_id)'...")
@@ -1510,10 +1523,22 @@ function _larval_bathymetry(opts::HydrodynamicOptions, store)
     src = GeoDataSources.preferred_bathymetry_source(; lon_range = lon_r, lat_range = lat_r)
     destination = joinpath(GeoDataSources.store_path(String(src)), "bathymetry.zarr")
     arr = try
-        ds = GeoDataSources.bathymetry_dataset(;
-            source = src, lon_range = lon_r, lat_range = lat_r,
-            output_path = destination, verbose = false)
-        GeoDataSources.bathymetry_arrays(ds)
+        ds = if ispath(destination)
+            GeoData.geoload(destination)
+        else
+            GeoDataSources.bathymetry_dataset(;
+                source = src, lon_range = lon_r, lat_range = lat_r,
+                output_path = destination, verbose = false)
+        end
+        elev_var = haskey(ds.variables, "elevation") ? "elevation" :
+                   first(GeoData.variables_like(ds, ["elevation", "altitude", "z", "topo"]))
+        elev_ga = ds.variables[elev_var]
+        perm = GeoData.dim_permutation(elev_ga.dims, :lon, :lat)
+        lon_c, _ = GeoData.axis(ds, :lon)
+        lat_c, _ = GeoData.axis(ds, :lat)
+        raw = Array{Float64}(elev_ga.data)
+        elev = ndims(raw) == 1 ? reshape(raw, :, 1) : permutedims(raw, perm)
+        (elevation = elev, lon = lon_c, lat = lat_c)
     catch err
         error("No seabed is available. The store carries no `bottom_height` and the central " *
               "lakehouse holds no bathymetry product for lon $(lon_r) lat $(lat_r) " *

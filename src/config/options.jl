@@ -80,7 +80,6 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `run_id::String`: Unique cohort identifier for Zarr persistence and figures.
 - `vertical_stretching_mode::Symbol`: Vertical grid stretching mode (:tanh, :uniform, or :csv).
 - `vertical_grid_file::String`: Path to CSV file specifying vertical layer boundary faces.
-- `resolution_scale::Float64`: Horizontal grid resolution scale multiplier / divisor.
 - `atmospheric_source::Symbol`: Atmospheric forcing provider (:era5, :synthetic, :climatology).
 - `ocean_boundary_source::Symbol`: Open boundary hydrographic data provider (:glorys12v1, :synthetic).
   See the field comments for the full accepted set.
@@ -168,13 +167,13 @@ struct HydrodynamicOptions
     checkpoint_dir           :: String
     checkpoint_cleanup       :: Bool
     auto_restart             :: Bool
+    overwrite                :: Bool
     run_id                   :: String
     vertical_stretching_mode :: Symbol
     nz_above :: Int
     vertical_break_depth :: Float64
     vertical_grid_file       :: String
     vertical_depths          :: Vector{Float64}
-    resolution_scale         :: Float64
     atmospheric_source :: Symbol
     ocean_boundary_source :: Symbol
     # The larger region the open-boundary data is cut from. These are separate from
@@ -369,13 +368,13 @@ function HydrodynamicOptions(;
     checkpoint_dir        :: AbstractString = "",
     checkpoint_cleanup    :: Bool = true,
     auto_restart             :: Bool = true,
+    overwrite                :: Bool = false,
     run_id                   :: AbstractString = "",
     vertical_stretching_mode :: Symbol = :oceananigans,
     nz_above :: Int = 0,
     vertical_break_depth :: Real = -400.0,
     vertical_grid_file       :: AbstractString = "",
     vertical_depths          :: AbstractVector{<:Real} = Float64[],
-    resolution_scale         :: Real = 1.0,
     atmospheric_source       :: Symbol = :era5,
     ocean_boundary_source    :: Symbol = :glorys12v1,
     embedding_lon            :: Tuple{Float64, Float64} = (-71.0, -53.0),
@@ -498,13 +497,13 @@ function HydrodynamicOptions(;
         String(checkpoint_dir),
         checkpoint_cleanup,
         auto_restart,
+        overwrite,
         String(run_id),
         vertical_stretching_mode,
         Int(nz_above),
         Float64(vertical_break_depth),
         String(vertical_grid_file),
         Float64[Float64(d) for d in vertical_depths],
-        Float64(resolution_scale),
         atmospheric_source,
         ocean_boundary_source,
         embedding_lon,
@@ -567,7 +566,6 @@ struct HydrodynamicConfig
     vertical_break_depth :: Float64
     vertical_grid_file       :: String
     vertical_depths          :: Vector{Float64}
-    resolution_scale         :: Float64
     bathymetry_source        :: Symbol
     bathy_source             :: String
     coastline_source         :: String

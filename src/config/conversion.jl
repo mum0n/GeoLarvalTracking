@@ -200,8 +200,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
                                get_val("paths", "checkpoint_dir", "")))
     cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", true))
     auto_res  = Bool(get_val("hydrodynamics", "auto_restart", true))
-
-    res_scale = Float64(get_val("grid", "resolution_scale", 1.0))
+    overwrite_val = Bool(get_val("hydrodynamics", "overwrite", false))
     v_mode_str = String(get_val("grid", "vertical_stretching_mode", "oceananigans"))
     # Two-segment shelf grid parameters. `vertical_stretching_mode = "two_segment"` splits `nz`
     # into a surface-refined upper segment above `vertical_break_depth` and a coarse lower segment,
@@ -363,14 +362,14 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         checkpoint_dir = cp_dir,
         checkpoint_cleanup = cp_clean,
         auto_restart = auto_res,
+        overwrite = overwrite_val,
         run_id = run_id_val,
         vertical_stretching_mode = v_mode,
         nz_above = nz_above_cfg,
         vertical_break_depth = vertical_break_depth,
         vertical_grid_file = v_file,
-    vertical_depths = v_depths,
-        resolution_scale = res_scale,
-    atmospheric_source = atmo_src,
+        vertical_depths = v_depths,
+        atmospheric_source = atmo_src,
     ocean_boundary_source = obc_src,
     embedding_lon = embedding_domain_ranges(config_dict).lon,
     embedding_lat = embedding_domain_ranges(config_dict).lat,
@@ -436,7 +435,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "nx" => opts.grid_size[1],
             "ny" => opts.grid_size[2],
             "nz" => opts.grid_size[3],
-            "resolution_scale" => opts.resolution_scale,
             "vertical_stretching_mode" => string(opts.vertical_stretching_mode),
             "nz_above" => opts.nz_above,
             "vertical_break_depth" => opts.vertical_break_depth,
@@ -495,7 +493,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "hydro_model_file" => opts.hydro_model_file,
             "hydro_only" => opts.hydro_only,
             "track_only" => opts.track_only,
-            "reuse_hydro" => opts.reuse_hydro
+            "reuse_hydro" => opts.reuse_hydro,
+            "overwrite" => opts.overwrite
         ),
         "biology" => Dict{String, Any}(
             "n_particles" => opts.n_particles,
@@ -592,7 +591,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :vertical_stretching_mode => opts.vertical_stretching_mode,
         :vertical_grid_file       => opts.vertical_grid_file,
         :vertical_depths          => opts.vertical_depths,
-        :resolution_scale         => opts.resolution_scale,
         :bathymetry_source        => Symbol(opts.bathy_source),
         :bathy_source              => opts.bathy_source,
         :coastline_source          => opts.coastline_source,
@@ -652,7 +650,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         d[:domain_lon], d[:domain_lat], d[:domain_z], d[:grid_size],
         Symbol(d[:vertical_stretching_mode]),         String(d[:vertical_grid_file]),
         Float64[Float64(x) for x in d[:vertical_depths]],
-        Float64(d[:resolution_scale]), Symbol(d[:bathymetry_source]),
+        Symbol(d[:bathymetry_source]),
         String(d[:bathy_source]), String(d[:coastline_source]), String(d[:wind_source]), String(d[:wind_time_iso]), Float64(d[:inshore_depth]),
         Float64(d[:shelf_slope]), Symbol(d[:atmospheric_source]),
         Symbol(d[:drag_formulation]), Bool(d[:bulk_heat_flux]),

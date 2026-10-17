@@ -67,6 +67,7 @@ function display_help(io::IO = stdout)
     Verbs:
       --rerun      Run the tracking again, reusing the existing hydrodynamic store.
       --force      Same, and overwrite the stored results rather than skipping them.
+      --overwrite  Alias for --force: overwrite stored results and re-track from t = 0.
       --quick      A short unsaved run to check the configuration still works. Writes
                    nothing that a later --rerun would need to skip.
       --viz        Render the figures from the stored results, without re-tracking.
@@ -106,13 +107,14 @@ function parse_args(args::Vector{String})
     out = Dict{String, Any}(
         "verb" => nothing, "config" => "", "hydro_file" => "", "save_config" => nothing,
         "help" => false)
-    verbs = Set(["--rerun", "--force", "--quick", "--viz"])
+    verbs = Set(["--rerun", "--force", "--overwrite", "--quick", "--viz"])
     for a in args
         if a in verbs
+            verb_name = a == "--overwrite" ? "force" : replace(a, "--" => "")
             out["verb"] !== nothing && error(
-                "Two verbs given: --$(replace(a, "--" => "")) and --$(out["verb"]). Name one; " *
+                "Two verbs given: --$(verb_name) and --$(out["verb"]). Name one; " *
                 "which one was meant is not a thing this script should guess.")
-            out["verb"] = replace(a, "--" => "")
+            out["verb"] = verb_name
         elseif a in ("--help", "-h")
             out["help"] = true
         elseif a == "--save-config"
@@ -201,10 +203,11 @@ function main(args::Vector{String})
     end
 
     if flags["verb"] == "rerun" || flags["verb"] == "force"
-        # A rerun reads what the existing store says and skips what it already covers; --force
-        # overwrites instead, so a repeat of an existing run replaces its results. The ocean
-        # store's identity is passed straight through as `hydro_file`, which is the only
-        # coupling with GeoOceanModel and a path, not a configuration.
+        if flags["verb"] == "force"
+            opts.overwrite = true
+        end
+        # A rerun reads what the existing store says and skips what it already covers; --force /
+        # --overwrite replaces stored results and re-tracks from t = 0.
         trajs = run_segment_tracking(opts = opts, hydro_file = hydro)
         run_segment_metrics(opts = opts, trajectories = trajs)
     elseif flags["verb"] == "viz"

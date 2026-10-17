@@ -222,7 +222,15 @@ function generate_depth_stratified_voronoi_units(
     elseif bathymetry isa NamedTuple && hasproperty(bathymetry, :elevation)
         bathymetry
     elseif bathymetry isa GeoDataset
-        GeoDataSources.bathymetry_arrays(bathymetry)
+        elev_var = haskey(bathymetry.variables, "elevation") ? "elevation" :
+                   first(GeoData.variables_like(bathymetry, ["elevation", "altitude", "z", "topo"]))
+        elev_ga = bathymetry.variables[elev_var]
+        perm = GeoData.dim_permutation(elev_ga.dims, :lon, :lat)
+        lon_c, _ = GeoData.axis(bathymetry, :lon)
+        lat_c, _ = GeoData.axis(bathymetry, :lat)
+        raw = Array{Float64}(elev_ga.data)
+        elev = ndims(raw) == 1 ? reshape(raw, :, 1) : permutedims(raw, perm)
+        (elevation = elev, lon = lon_c, lat = lat_c)
     elseif bathymetry isa Symbol && bathymetry !== :numerical_earth
         _bathy_grid(bathymetry, lon_range, lat_range)
     else

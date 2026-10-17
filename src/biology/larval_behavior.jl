@@ -1116,6 +1116,7 @@ function larval_transport_step(
     v_stokes::Real = 0.0,
     stokes_decay_depth::Real = 10.0,
     max_current_speed::Union{Nothing, Real} = 3.0,
+    bathymetry_gradient::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
     rng::AbstractRNG = Random.default_rng()
 )
     # If settled on bottom or dead, particle remains at seabed
@@ -1144,6 +1145,15 @@ function larval_transport_step(
 
     # 1. Logarithmic Bottom Boundary Layer (BBL) velocity attenuation (law of the wall)
     f_bbl = enable_bbl ? bbl_velocity_factor(z, z_bottom, h_bbl = h_bbl, z0 = z0) : 1.0
+
+    # Topographic steering: Near the seabed (within h_bbl), enforce kinematic non-divergence
+    # along the high-resolution bathymetry: w_topo = u*∂h/∂x + v*∂h/∂y, ensuring larvae do not
+    # advect artificially into rising topography.
+    w_topo = 0.0
+    if !isnothing(bathymetry_gradient) && (z - z_bottom) <= h_bbl
+        dh_dx, dh_dy = bathymetry_gradient
+        w_topo = u * dh_dx + v * dh_dy
+    end
 
     # Wave-induced Stokes drift with exponential surface attenuation: u_s(z) = u_s0 * exp(2kz)
     f_stokes = (u_stokes != 0.0 || v_stokes != 0.0) ? exp(max(-20.0, z / max(1.0, stokes_decay_depth))) : 0.0
@@ -1174,9 +1184,10 @@ function larval_transport_step(
     dx_meters = u_eff * dt + sqrt(max(0.0, 2.0 * κ_h * dt)) * ξ_x
     dy_meters = v_eff * dt + sqrt(max(0.0, 2.0 * κ_h * dt)) * ξ_y
 
-    # 3. Visser (1997) diffusive pseudo-drift correction: dκ_v/dz term prevents artificial
-    # accumulation of particles in low-diffusivity pycnoclines
-    dz_meters = (w + w_swim + w_sink + κ_v_gradient) * dt + sqrt(max(0.0, 2.0 * κ_v * dt)) * ξ_z
+    # 3. Visser (1997) diffusive pseudo-drift correction & topographic non-divergence:
+    # dκ_v/dz term prevents artificial accumulation in pycnoclines; w_topo steers advection
+    # along the high-resolution bathymetric floor.
+    dz_meters = (w + w_topo + w_swim + w_sink + κ_v_gradient) * dt + sqrt(max(0.0, 2.0 * κ_v * dt)) * ξ_z
 
     if is_lat_lon
         r_earth = 6.371e6
@@ -1777,6 +1788,26 @@ function track_larval_cohort(
             cur_bed_T = isnothing(temperature_fn) ? Float64(default_temperature) :
                         temperature_fn(cur_lon, cur_lat, z_bed, t_current)
 
+            # High-resolution topographic gradient for kinematic steering (∂h/∂x, ∂h/∂y)
+            bathy_grad = if !isnothing(bathymetry_fn) && is_lat_lon
+                # Finite difference step of ~250m (~0.0025 deg lat, adjusted for cos_lat)
+                d_lat = 0.0025
+                cos_l = max(cosd(clamp(Float64(cur_lat), -85.0, 85.0)), cosd(85.0))
+                d_lon = d_lat / cos_l
+                r_e = 6.371e6
+                m_per_deg_lat = π * r_e / 180.0
+                m_per_deg_lon = π * r_e * cos_l / 180.0
+                h_e = Float64(bathymetry_fn(cur_lon + d_lon, cur_lat))
+                h_w = Float64(bathymetry_fn(cur_lon - d_lon, cur_lat))
+                h_n = Float64(bathymetry_fn(cur_lon, cur_lat + d_lat))
+                h_s = Float64(bathymetry_fn(cur_lon, cur_lat - d_lat))
+                dh_dx = (h_e - h_w) / (2.0 * d_lon * m_per_deg_lon)
+                dh_dy = (h_n - h_s) / (2.0 * d_lat * m_per_deg_lat)
+                (dh_dx, dh_dy)
+            else
+                nothing
+            end
+
             # Filter high-frequency semi-diurnal M2 tidal temperature oscillations (tau ≈ 12.42 h = 44712 s)
             alpha_tidal = clamp(dt / 44712.0, 0.005, 1.0)
             t_bed_filtered[p] = (1.0 - alpha_tidal) * t_bed_filtered[p] + alpha_tidal * cur_bed_T
@@ -1937,6 +1968,7 @@ function track_larval_cohort(
                 u_stokes = u_stk,
                 v_stokes = v_stk,
                 stokes_decay_depth = stokes_decay_depth,
+                bathymetry_gradient = bathy_grad,
                 rng = rng
             )
 
