@@ -58,6 +58,10 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
 
     # Tidal body forcing. `constituents` is an empty list in a config that disables tides, so
     # an empty read is not an error; it simply means no constituents were requested.
+    #
+    # NOTE: Tide is now carried by GeoOceanModel's stored flow field (TPXO9 boundary forcing,
+    # placement = :boundary). GeoLarvalTracking reads it from the store and does NOT superpose
+    # analytic tide on top — that would double-count. `enable_tides` defaults to false here.
     tides_src = String(get_val("tides", "tides_source", "tpxo9"))
     raw_cons = get_val("tides", "constituents", Any[:M2, :S2])
     # Normalised to upper case because `get_tidal_frequency` dispatches on `:M2`/`:S2`
@@ -65,7 +69,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # means a TOML writing "m2" and one writing "M2" behave identically.
     tidal_cons = Symbol[Symbol(uppercase(String(c))) for c in raw_cons]
 
-    enable_tides = Bool(get_val("tides", "enable_tides", true))
+    enable_tides = Bool(get_val("tides", "enable_tides", false))
     tides_source = tides_src
     tidal_constituents = tidal_cons
     tidal_u = Float64(get_val("tides", "tidal_u_amp", 0.25))

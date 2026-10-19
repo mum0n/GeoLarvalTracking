@@ -297,6 +297,12 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         # Tidal superposition: When reading from a slowly-evolving subsampled store (e.g. 6-hour or daily),
         # high-frequency tidal velocity is reconstructed analytically: u(x,t) = u_subsampled(x,t) + u_tide(x,t).
         # This saves 6x to 24x disk storage while preserving tidal excursion fidelity.
+        #
+        # NOTE: GeoOceanModel now carries tide via TPXO9 boundary forcing (placement = :boundary),
+        # so the stored flow field already contains the real tidal cycle. GeoLarvalTracking must NOT
+        # superpose analytic tide on top — that would double-count. `enable_tides` defaults to false.
+        # Set `enable_tides = true` only when reading from a store that predates GeoOceanModel's
+        # tide-on-boundary design.
         enable_tides = opts.enable_tides,
         tidal_u_amp = opts.tidal_u_amp,
         tidal_v_amp = opts.tidal_v_amp,

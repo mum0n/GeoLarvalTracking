@@ -177,7 +177,10 @@ function get_default_configuration()::Dict{String, Any}
             "bulk_heat_flux" => true
         ),
         "tides" => Dict{String, Any}(
-            "enable_tides" => true,
+            # Tide is carried by GeoOceanModel's stored flow field (TPXO9 boundary forcing).
+            # GeoLarvalTracking reads it from the store; do NOT superpose analytic tide on top
+            # — that would double-count.
+            "enable_tides" => false,
             "constituents" => ["M2"],
             "tidal_u_amp" => 0.25,
             "tidal_v_amp" => 0.12,

@@ -202,14 +202,17 @@ function main(args::Vector{String})
               "--hydro-file=PATH, produced by GeoOceanModelRun.jl.")
     end
 
-    if flags["verb"] == "rerun" || flags["verb"] == "force"
+    if flags["verb"] == "rerun" || flags["verb"] == "force" || flags["verb"] == "quick"
         if flags["verb"] == "force"
             opts.overwrite = true
         end
         # A rerun reads what the existing store says and skips what it already covers; --force /
-        # --overwrite replaces stored results and re-tracks from t = 0.
+        # --overwrite replaces stored results and re-tracks from t = 0. --quick runs tracking
+        # without metrics, for checking that the configuration still works.
         trajs = run_segment_tracking(opts = opts, hydro_file = hydro)
-        run_segment_metrics(opts = opts, trajectories = trajs)
+        if flags["verb"] != "quick"
+            run_segment_metrics(opts = opts, trajectories = trajs)
+        end
     elseif flags["verb"] == "viz"
         render_all_figures(opts = opts)
     end
