@@ -16,3 +16,4 @@ import CairoMakie: record
 include(joinpath(@__DIR__, "figures", "larval_disperal.jl"))
 include(joinpath(@__DIR__, "figures", "shared_figures.jl"))
 include(joinpath(@__DIR__, "figures", "interactive_html.jl"))
+include(joinpath(@__DIR__, "figures", "hydrodynamic_figures.jl"))

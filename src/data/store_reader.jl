@@ -275,3 +275,122 @@ end
 The location a consumer is handed. A path, and nothing else.
 """
 store_location(location::AbstractString) = abspath(location)
+
+"""
+    extract_hydrodynamic_dataset(location::AbstractString; time_index::Int = 1, time_seconds::Union{Nothing, Real} = nothing,
+                                  domain_lon::Tuple{<:Real, <:Real} = (-180.0, 180.0),
+                                  domain_lat::Tuple{<:Real, <:Real} = (-90.0, 90.0),
+                                  grid_size::Tuple{Int, Int} = (0, 0)) -> NamedTuple
+
+Read one interval from a GeoOceanModel Zarr store and return a NamedTuple compatible with
+the figure pipeline. Fields: lons, lats, depths, u, v, w, temperature, salinity,
+bathymetry, speed, diffusion, stratification, time_seconds, depth_index, depth_m.
+
+This is GeoLarvalTracking's local reader for the shared store layout. The two packages do not
+import each other; each defines its own reader for the store that GeoOceanModel writes.
+
+# Inputs
+- `location`: Path to a Zarr store directory written by GeoOceanModel.
+- `time_index`: 1-based snapshot index.
+- `time_seconds`: If provided, the nearest interval to this time is selected (overrides
+  `time_index`).
+- `domain_lon`, `domain_lat`: Accepted for API compatibility with GeoOceanModel's reader;
+  the Zarr store already carries its own coordinates, so these are not used for subsetting.
+- `grid_size`: Accepted for API compatibility; the Zarr store carries its own resolution.
+
+# Outputs
+A NamedTuple with fields matching GeoOceanModel's `extract_hydrodynamic_dataset` output,
+so figure families can consume either package's store reader interchangeably.
+"""
+function extract_hydrodynamic_dataset(location::AbstractString;
+                                       time_index::Union{Nothing, Int} = nothing,
+                                       time_seconds::Union{Nothing, Real} = nothing,
+                                       domain_lon::Tuple{<:Real, <:Real} = (-180.0, 180.0),
+                                       domain_lat::Tuple{<:Real, <:Real} = (-90.0, 90.0),
+                                       grid_size::Tuple{Int, Int} = (0, 0))
+    store = open_hydrodynamics(location)
+
+    n_t = length(store.times)
+
+    # Resolve time_index from time_seconds if provided
+    if !isnothing(time_seconds)
+        times = Float64.(store.times)
+        time_index = argmin(abs.(times .- Float64(time_seconds)))
+    elseif isnothing(time_index)
+        time_index = 1
+    end
+    !(1 <= time_index <= n_t) && error(
+        "Interval $time_index is out of range: this run wrote $(n_t) interval(s).")
+
+    lons = store.axes.lon
+    lats = store.axes.lat
+    depths = store.axes.depth
+    t_sec = Float64(store.times[time_index])
+
+    # Read all fields at this interval
+    u = variable(store, "u", time_index)
+    v = variable(store, "v", time_index)
+    w = variable(store, "w", time_index)
+    T = variable(store, "T", time_index)
+
+    # Salinity may or may not be in the store; default to reference 35 PSU if absent
+    available = Set(store.variables)
+    S = if "S" in available || "salinity" in available
+        name = "S" in available ? "S" : "salinity"
+        variable(store, name, time_index)
+    else
+        fill(35.0, size(T))
+    end
+
+    speed = sqrt.(u.^2 .+ v.^2)
+
+    # Vertical eddy diffusivity κ_v — the store carries u, v, w, T only; diffusivity is a
+    # derived closure field. Use a background value consistent with the model's closure
+    # (1e-4 m²/s is typical shelf-ocean background mixing).
+    diffusion = fill(1.0e-4, size(T))
+
+    # Buoyancy frequency squared N² from vertical temperature gradient (linear EOS):
+    #   N² = -g/ρ₀ * ∂ρ/∂z = g * α * ∂T/∂z   (thermal expansion only)
+    # depths are negative below surface; ∂T/∂z computed by centered differences.
+    g = 9.81      # m/s²
+    alpha = 1.7e-4 # K⁻¹ thermal expansion coefficient
+    nz = length(depths)
+    stratification = similar(T)
+    for k in 1:nz
+        if k == 1
+            dT_dz = (T[:, :, 2] - T[:, :, 1]) / (depths[2] - depths[1])
+        elseif k == nz
+            dT_dz = (T[:, :, nz] - T[:, :, nz - 1]) / (depths[nz] - depths[nz - 1])
+        else
+            dT_dz = (T[:, :, k + 1] - T[:, :, k - 1]) / (depths[k + 1] - depths[k - 1])
+        end
+        stratification[:, :, k] = g * alpha .* dT_dz
+    end
+
+    # Bathymetry from the store if available, else negative constant (wet shelf)
+    bathy = if "bathymetry" in available || "depth" in available
+        name = "bathymetry" in available ? "bathymetry" : "depth"
+        variable(store, name, 1)
+    else
+        fill(-100.0, length(lons), length(lats))
+    end
+
+    return (
+        lons = lons,
+        lats = lats,
+        depths = depths,
+        u = u,
+        v = v,
+        w = w,
+        temperature = T,
+        salinity = S,
+        speed = speed,
+        diffusion = diffusion,
+        stratification = stratification,
+        bathymetry = bathy,
+        elevation = bathy,   # alias for interactive HTML which reads .elevation
+        time_seconds = t_sec,
+        depth_index = 1,
+        depth_m = Float64(depths[1]),
+    )
+end
