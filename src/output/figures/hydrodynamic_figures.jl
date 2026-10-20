@@ -142,7 +142,7 @@ function plot_hydrodynamic_tracers(
                    colorrange = (minimum(S_k), maximum(S_k)))
     Colorbar(fig[1, 4], hm2, label = "PSU")
 
-    fig[0, :] = Label(fig, "Hydrodynamic Tracers — $(isempty(title) ? "" : title)[Depth: $(round(depth_m, digits=1)) m | Time: $(round(t_hr, digits=1)) h]",
+    fig[0, :] = Label(fig, "Hydrodynamic Tracers - $(isempty(title) ? "" : title)\\n[Depth: $(round(depth_m, digits=1)) m | Time: $(round(t_hr, digits=1)) h]",
         fontsize = 14, font = :bold)
 
     if !isnothing(output_path)
