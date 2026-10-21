@@ -2,7 +2,6 @@
     larval_behavior.jl
 
 Snow crab (*Chionoecetes opilio*) larval behavior, Diel Vertical Migration (DVM),
-thermal degree-day ontogenetic molting, tidal current superposition, and
 benthic nursery settlement suitability filtering.
 """
 
@@ -334,125 +333,6 @@ function diel_vertical_migration_velocity(
     w_swim = w_max * tanh(dz / relaxation_depth)
     return Float64(w_swim)
 end
-
-"""
-    superpose_tidal_velocity(
-        u_mean::Real,
-        v_mean::Real,
-        t::Real;
-        u_amp::Real = 0.25,
-        v_amp::Real = 0.12,
-        period::Real = 44712.0,
-        phase::Real = 0.0
-    )
-
-Superpose semi-diurnal \$M_2\$ tidal current oscillations onto mean hydrodynamic
-background flow.
-
-# Mathematical Formulation
-```math
-u_{\\text{total}}(t) = u_{\\text{mean}} + u_{\\text{amp}} \\cos\\left( \\frac{2\\pi t}{T_{M2}} + \\phi \\right)
-```
-```math
-v_{\\text{total}}(t) = v_{\\text{mean}} + v_{\\text{amp}} \\sin\\left( \\frac{2\\pi t}{T_{M2}} + \\phi \\right)
-```
-where \$T_{M2} \\approx 12.42\\text{ hours} = 44712\\text{ s}\$.
-
-# Inputs
-- `u_mean, v_mean::Real`: Background Eulerian flow velocities in \$m s^{-1}\$.
-- `t::Real`: Current time in seconds.
-- `u_amp, v_amp::Real`: Semi-major and semi-minor tidal velocity amplitudes (m s⁻¹).
-- `period::Real`: Tidal constituent period in seconds (default 44712.0 s for \$M_2\$).
-- `phase::Real`: Initial phase offset in radians.
-- `constituents::Union{Nothing, Vector{Symbol}}`: Optional vector of constituents (e.g. `[:M2, :S2]`).
-- `u_amplitudes, v_amplitudes::Union{Nothing, Dict{Symbol, Float64}}`: Multi-constituent amplitudes.
-- `phases::Union{Nothing, Dict{Symbol, Float64}}`: Multi-constituent phase offsets.
-
-# Outputs
-- `Tuple{Float64, Float64}`: Total velocities `(u_tot, v_tot)`.
-"""
-function superpose_tidal_velocity(
-    u_mean::Real,
-    v_mean::Real,
-    t::Real;
-    u_amp::Real = 0.25,
-    v_amp::Real = 0.12,
-    period::Real = 44712.0,
-    phase::Real = 0.0,
-    constituents::Union{Nothing, Vector{Symbol}} = nothing,
-    u_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
-    v_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
-    phases::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing
-)
-    if !isnothing(constituents) && !isempty(constituents)
-        u_amps = something(u_amplitudes, Dict(:M2 => Float64(u_amp)))
-        v_amps = something(v_amplitudes, Dict(:M2 => Float64(v_amp)))
-        phs    = something(phases, Dict(:M2 => Float64(phase)))
-        u_tide, v_tide = tidal_velocity_vector(
-            t,
-            constituents = constituents,
-            u_amplitudes = u_amps,
-            v_amplitudes = v_amps,
-            phases = phs
-        )
-        return (Float64(u_mean + u_tide), Float64(v_mean + v_tide))
-    else
-        omega = 2.0 * π / period
-        u_tide = u_amp * cos(omega * t + phase)
-        v_tide = v_amp * sin(omega * t + phase)
-        return (Float64(u_mean + u_tide), Float64(v_mean + v_tide))
-    end
-end
-
-"""
-    tidal_velocity_vector(t; constituents, u_amplitudes, v_amplitudes, phases) -> (u, v)
-
-The tidal velocity of several constituents at time `t`, as the sum of each one's two
-perpendicular sinusoids, `A·cos(ωt + φ)` and `B·sin(ωt + φ)` with `ω = 2π/period`.
-
-This is the larval half's own part of a tidal cycle. The *tides* themselves -- which
-constituents exist and what their amplitudes are at a coordinate -- belong to the ocean half
-and are read from the store, so this function takes the amplitudes as given and only adds the
-oscillation. The single-constituent case above is the same sum with one term, which is why the
-branch exists: `superpose_tidal_velocity` calls this only when a run names constituents.
-"""
-function tidal_velocity_vector(
-    t::Real;
-    constituents::Vector{Symbol},
-    u_amplitudes::AbstractDict{Symbol, <:Real},
-    v_amplitudes::AbstractDict{Symbol, <:Real},
-    phases::AbstractDict{Symbol, <:Real}
-)
-    u = 0.0
-    v = 0.0
-    for k in constituents
-        haskey(u_amplitudes, k) && haskey(v_amplitudes, k) && haskey(phases, k) || error(
-            "Constituent $(k) is named but its amplitudes and phase are not. A constituent " *
-            "with no amplitude adds nothing, and silently skipping it would produce a current " *
-            "that is not the stated one.")
-        omega = 2.0 * π / TIDAL_PERIODS_S[k]
-        phi = Float64(phases[k])
-        u += Float64(u_amplitudes[k]) * cos(omega * Float64(t) + phi)
-        v += Float64(v_amplitudes[k]) * sin(omega * Float64(t) + phi)
-    end
-    return (u, v)
-end
-
-"""
-    TIDAL_PERIODS_S
-
-The period of each tidal constituent this package superposes, in seconds. Only what the larval
-half needs is listed: these are the constituent periods, which are physics rather than a choice.
-"""
-const TIDAL_PERIODS_S = Dict{Symbol, Float64}(
-    :M2 => 44712.0,
-    :S2 => 43200.0,
-    :N2 => 45570.2,
-    :K2 => 43082.1,
-    :K1 => 86164.1,
-    :O1 => 92949.7,
-    :P1 => 86636.4
-)
 
 """
     bbl_velocity_factor(
@@ -1112,6 +992,14 @@ function larval_transport_step(
     is_ascending::Bool = false,
     ascent_speed::Real = 0.010,
     surface_target::Real = -10.0,
+    zoea1_day_depth::Real = -50.0,
+    zoea1_night_depth::Real = -10.0,
+    zoea2_day_depth::Real = -55.0,
+    zoea2_night_depth::Real = -8.0,
+    megalopa_day_depth::Real = -120.0,
+    megalopa_night_depth::Real = -60.0,
+    zoea2_depth_factor::Real = 1.2,
+    megalopa_swim_factor::Real = 1.5,
     u_stokes::Real = 0.0,
     v_stokes::Real = 0.0,
     stokes_decay_depth::Real = 10.0,
@@ -1168,7 +1056,15 @@ function larval_transport_step(
         stage = stage,
         initial_ascent = is_ascending,
         ascent_speed = ascent_speed,
-        surface_target = surface_target
+        surface_target = surface_target,
+        day_depth = zoea1_day_depth,
+        night_depth = zoea1_night_depth,
+        zoea2_day_depth = zoea2_day_depth,
+        zoea2_night_depth = zoea2_night_depth,
+        megalopa_day_depth = megalopa_day_depth,
+        megalopa_night_depth = megalopa_night_depth,
+        zoea2_depth_factor = zoea2_depth_factor,
+        megalopa_swim_factor = megalopa_swim_factor
     )
     w_sink = enable_sinking ? larval_passive_sinking_velocity(
         stage,
@@ -1548,7 +1444,6 @@ end
         κ_h::Real = 10.0,
         κ_v::Real = 1e-4,
         is_lat_lon::Bool = true,
-        enable_tides::Bool = false,
         enable_molting::Bool = true,
         rng::AbstractRNG = Random.default_rng()
     )
@@ -1567,32 +1462,35 @@ and benthic settlement suitability.
 - `κ_h::Real`: Horizontal turbulent eddy diffusivity in \$m^2 s^{-1}\$.
 - `κ_v::Real`: Vertical turbulent eddy diffusivity in \$m^2 s^{-1}\$.
 - `is_lat_lon::Bool`: Coordinate format flag.
-- `enable_tides::Bool`: Whether to superpose \$M_2\$ tidal currents.
 - `enable_molting::Bool`: Whether to update stages via thermal degree-days.
 - `default_temperature::Real`: Fallback temperature if `temperature_fn = nothing` (default 4.0 °C).
 - `default_bottom_depth::Real`: Fallback seabed depth if `bathymetry_fn = nothing` (default -1000.0 m).
-- `t_base::Real`: Baseline development threshold temperature \$T_0\$ for degree-days (default 0.0 °C).
-- `dd_zoea1_to_zoea2::Real`: Degree-day threshold for Zoea I -> Zoea II molt (default 150.0).
-- `dd_zoea2_to_megalopa::Real`: Degree-day threshold for Zoea II -> Megalopa molt (default 310.0).
-- `dd_megalopa_to_settle::Real`: Degree-day threshold for Megalopa -> Instar I settlement (default 510.0).
+- `t_base::Real`: Baseline development threshold temperature \$T_0\$ for degree-days (default -1.5 °C).
+- `dd_zoea1_to_zoea2::Real`: Degree-day threshold for Zoea I -> Zoea II molt (default 65.0).
+- `dd_zoea2_to_megalopa::Real`: Degree-day threshold for Zoea II -> Megalopa molt (default 130.0).
+- `dd_megalopa_to_settle::Real`: Degree-day threshold for Megalopa -> Instar I settlement (default 200.0).
 - `mortality_base::Real`: Baseline daily natural mortality rate (default 0.02 day⁻¹).
-- `mortality_thermal_threshold::Real`: Thermal stress mortality threshold in °C (default 10.0 °C).
+- `mortality_thermal_threshold::Real`: Thermal stress mortality threshold in °C (default 7.0 °C).
 - `mortality_thermal_sensitivity::Real`: Thermal mortality multiplier (default 0.015).
+- `mortality_cold_threshold::Real`: Cold stress mortality threshold in °C (default -1.5 °C).
+- `mortality_cold_sensitivity::Real`: Cold mortality multiplier (default 0.01).
 - `settlement_min_depth::Real`: Deepest boundary for nursery settlement habitat (default -250.0 m).
 - `settlement_max_depth::Real`: Shallowest boundary for nursery settlement habitat (default -50.0 m).
 - `settlement_max_temp::Real`: Maximum bottom temperature for suitable settlement (default 6.0 °C).
 - `settlement_stochastic::Bool`: Whether to evaluate settlement probabilistically via HSI (default true).
 - `competence_window_days::Real`: Maximum pelagic search window for competent megalopae in days (default 15.0 days).
-- `tidal_u_amp::Real`: Zonal tidal velocity amplitude in m/s (default 0.25 m/s).
-- `tidal_v_amp::Real`: Meridional tidal velocity amplitude in m/s (default 0.12 m/s).
-- `tidal_period::Real`: Tidal constituent period in seconds (default 44712.0 s).
-- `tidal_phase::Real`: Tidal initial phase offset in radians (default 0.0).
 - `min_survival_prob::Real`: Survival probability below which particle is marked dead (default 0.01).
 - `enable_initial_ascent::Bool`: Whether newly released larvae perform directed vertical ascent
   from benthic release depths to the surface mixed layer (default true).
 - `ascent_speed::Real`: Upward swimming speed during ascent in \$m s^{-1}\$ (default 0.010 m/s).
 - `ascent_target_depth::Real`: Target epipelagic depth for ascent in meters (default -10.0 m).
 - `max_ascent_duration::Real`: Maximum allowed duration for initial ascent in seconds (default 86400.0 s).
+- `zoea1_day_depth`, `zoea1_night_depth`, `zoea2_day_depth`, `zoea2_night_depth`,
+  `megalopa_day_depth`, `megalopa_night_depth::Real`: The depth the cohort holds by day
+  and by night, per stage. Passed to the DVM velocity; the behaviour module's own
+  defaults are the fallback, and the run's configuration overrides them.
+- `zoea2_depth_factor`, `megalopa_swim_factor::Real`: Swim-speed multipliers for the
+  Zoea II and Megalopa stages (defaults 1.2 and 1.5).
 - `rng::AbstractRNG`: Random number generator.
 
 # Outputs
@@ -1608,7 +1506,6 @@ function track_larval_cohort(
     κ_h::Real = 10.0,
     κ_v::Real = 1e-4,
     is_lat_lon::Bool = true,
-    enable_tides::Bool = false,
     enable_molting::Bool = true,
     default_temperature::Real = 4.0,
     default_bottom_depth::Real = -1000.0,
@@ -1626,14 +1523,6 @@ function track_larval_cohort(
     settlement_max_temp::Real = 6.0,
     settlement_stochastic::Bool = true,
     competence_window_days::Real = 15.0,
-    tidal_u_amp::Real = 0.25,
-    tidal_v_amp::Real = 0.12,
-    tidal_period::Real = 44712.0,
-    tidal_phase::Real = 0.0,
-    tidal_constituents::Union{Nothing, Vector{Symbol}} = nothing,
-    tidal_u_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
-    tidal_v_amplitudes::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
-    tidal_phases::Union{Nothing, AbstractDict{Symbol, <:Real}} = nothing,
     enable_bbl::Bool = true,
     h_bbl::Real = 10.0,
     z0::Real = 0.001,
@@ -1648,6 +1537,14 @@ function track_larval_cohort(
     ascent_speed::Real = 0.010,
     ascent_target_depth::Real = -10.0,
     max_ascent_duration::Real = 86400.0,
+    zoea1_day_depth::Real = -50.0,
+    zoea1_night_depth::Real = -10.0,
+    zoea2_day_depth::Real = -55.0,
+    zoea2_night_depth::Real = -8.0,
+    megalopa_day_depth::Real = -120.0,
+    megalopa_night_depth::Real = -60.0,
+    zoea2_depth_factor::Real = 1.2,
+    megalopa_swim_factor::Real = 1.5,
     max_current_speed::Union{Nothing, Real} = 3.0,
     cv_molt::Real = 0.0,
     cv_mortality::Real = 0.0,
@@ -1766,19 +1663,6 @@ function track_larval_cohort(
 
             # Query background velocity
             u, v, w = velocity_fn(cur_lon, cur_lat, cur_depth, t_current)
-            if enable_tides
-                u, v = superpose_tidal_velocity(
-                    u, v, t_current,
-                    u_amp = tidal_u_amp,
-                    v_amp = tidal_v_amp,
-                    period = tidal_period,
-                    phase = tidal_phase,
-                    constituents = tidal_constituents,
-                    u_amplitudes = tidal_u_amplitudes,
-                    v_amplitudes = tidal_v_amplitudes,
-                    phases = tidal_phases
-                )
-            end
 
             # Query temperature and seabed depth
             cur_T = isnothing(temperature_fn) ? Float64(default_temperature) :
@@ -1965,6 +1849,14 @@ function track_larval_cohort(
                 is_ascending = is_ascending,
                 ascent_speed = ascent_speed,
                 surface_target = ascent_target_depth,
+                zoea1_day_depth = zoea1_day_depth,
+                zoea1_night_depth = zoea1_night_depth,
+                zoea2_day_depth = zoea2_day_depth,
+                zoea2_night_depth = zoea2_night_depth,
+                megalopa_day_depth = megalopa_day_depth,
+                megalopa_night_depth = megalopa_night_depth,
+                zoea2_depth_factor = zoea2_depth_factor,
+                megalopa_swim_factor = megalopa_swim_factor,
                 u_stokes = u_stk,
                 v_stokes = v_stk,
                 stokes_decay_depth = stokes_decay_depth,

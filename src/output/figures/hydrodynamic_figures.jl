@@ -464,7 +464,7 @@ function plot_hydrodynamic_ts_diagram(
     S_all = Float64.(hydro.salinity[:])
 
     # Filter NaN
-    valid = .(!isnan.(T_all) .& !isnan.(S_all))
+    valid = (!isnan.(T_all)) .& (!isnan.(S_all))
 
     fig = Figure(size = (500, 450), fontsize = 12)
     ax = Axis(fig[1, 1],

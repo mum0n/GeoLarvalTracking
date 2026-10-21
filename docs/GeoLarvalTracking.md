@@ -19,7 +19,7 @@ Originally parameterized for the **Scotian Shelf snow crab (*Chionoecetes opilio
                                 ▼
   2. 3D Hydrodynamic Model (Oceananigans.jl on CUDA GPU / Multi-Threaded CPU)
      - Spherical Curvilinear Grid + Immersed Boundary Topography
-     - M2/S2 Tidal Harmonic Body Forcing + Coriolis + Seawater Buoyancy
+     - Coriolis + Seawater Buoyancy, with the tide read from the ocean half's store
      - CMIP6 Climate Scenarios (Historical, SSP1-2.6, SSP2-4.5, SSP5-8.5, MHW)
                                 │
                                 ▼
@@ -59,7 +59,6 @@ ParticleTracking/
 ├── Project.toml                      # Project dependencies & UUID declarations
 ├── inputs/
 │   ├── ParticleTracking.config       # Master centralized configuration file
-│   ├── snowcrab_tesselated.config    # Calibrated depth-stratified Voronoi tessellation config
 │   ├── coastline.dat                 # Nova Scotia coastline boundary polygon vertices
 │   ├── cfa4x.dat                     # CFA 4X boundary polygon vertices
 │   ├── cfanorth.dat                  # CFA North (20-22) boundary polygon vertices
@@ -75,12 +74,11 @@ ParticleTracking/
 │   ├── synthetic_data.jl             # Idealized bathymetry & wind benchmark generator
 │   ├── grid_bathymetry.jl            # Spherical grid & cut-cell immersed boundary setup
 │   ├── hydrodynamic_model.jl         # Hydrostatic primitive equation model setup & heat flux
-│   ├── tides.jl                      # Astronomical tidal forcing & Simpson-Hunter metric
+│   ├── tides.jl                      # Simpson-Hunter tidal-mixing metric (diagnostic only)
 │   ├── climate_scenarios.jl          # CMIP6 anomalies, PLD formulas, thermal mortality
 │   ├── simulation.jl                 # Oceananigans time integration & adaptive CFL
 │   ├── larval_behavior.jl            # DVM swimming, BBL shear, sinking, drift, tracking
 │   ├── empirical_analysis.jl         # Taylor dispersion, CFA polygons & connectivity
-│   ├── voronoi_tessellation.jl       # Depth-stratified Voronoi areal units & demographic matrices
 │   ├── larval_storage.jl             # GeoData analytical storage backend & ensemble averaging
 │   └── visualization.jl              # CairoMakie plots, video animations & Leaflet map
 ├── test/
@@ -94,18 +92,17 @@ ParticleTracking/
 
 | Source File                                                                                            | Primary Purpose                                               | Exported Functions / Types                                                                                                                                                                                                                                                                                                |
 | :-------------------------------------------------------------------------------------------------------| :--------------------------------------------------------------| :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`src/configuration.jl`](file:///c:/home/jae/projects/ParticleTracking/src/configuration.jl)           | Centralized TOML configuration parsing and options conversion | `HydrodynamicOptions`, `load_configuration`, `save_configuration`, `configuration_to_options`, `options_to_configuration`, `get_default_configuration`, `find_default_config_path`, `get_snowcrab_tesselated_configuration`, `SnowCrabTesselatedRunOptions`                                                                                                                                        |
+| [`src/configuration.jl`](file:///c:/home/jae/projects/ParticleTracking/src/configuration.jl)           | Centralized TOML configuration parsing and options conversion | `HydrodynamicOptions`, `load_configuration`, `save_configuration`, `configuration_to_options`, `options_to_configuration`, `get_default_configuration`, `find_default_config_path`                                                                                                                                        |
 | [`src/architecture.jl`](file:///c:/home/jae/projects/ParticleTracking/src/architecture.jl)             | Hardware platform detection and device allocation             | `resolve_architecture`                                                                                                                                                                                                                                                                                                    |
 | [`src/open_data.jl`](file:///c:/home/jae/projects/ParticleTracking/src/open_data.jl)                   | NOAA ERDDAP bathymetry & wind ingestion, drag laws            | `fetch_open_bathymetry`, `fetch_open_surface_winds`, `wind_speed_to_kinematic_stress`, `regrid_2d_field`                                                                                                                                                                                                                  |
 | [`src/synthetic_data.jl`](file:///c:/home/jae/projects/ParticleTracking/src/synthetic_data.jl)         | Synthetic idealized benchmarks & NetCDF inspection            | `download_sample_data`, `inspect_netcdf`, `generate_synthetic_bathymetry`, `generate_synthetic_forcing`                                                                                                                                                                                                                   |
 | [`src/grid_bathymetry.jl`](file:///c:/home/jae/projects/ParticleTracking/src/grid_bathymetry.jl)       | Spherical grid & cut-cell immersed boundary setup             | `build_shelf_grid`, `load_bathymetry_from_netcdf`, `apply_immersed_bathymetry`, `get_bathymetry_interpolator`, `load_coastline_polygons`, `is_point_on_land`                                                                                                                                                            |
 | [`src/hydrodynamic_model.jl`](file:///c:/home/jae/projects/ParticleTracking/src/hydrodynamic_model.jl) | Hydrostatic Boussinesq primitive equation & heat flux         | `build_hydrodynamic_model`, `set_initial_stratification!`                                                                                                                                                                                                                                                                 |
-| [`src/tides.jl`](file:///c:/home/jae/projects/ParticleTracking/src/tides.jl)                           | Astronomical tidal forcing, spring-neap & Simpson-Hunter      | `build_tidal_body_forcing`, `tidal_velocity_vector`, `get_tidal_frequency`, `simpson_hunter_parameter`                                                                                                                                                                                                                     |
+| [`src/tides.jl`](file:///c:/home/jae/projects/ParticleTracking/src/tides.jl)                           | Simpson-Hunter tidal-mixing diagnostic                       | `simpson_hunter_parameter`                                                                                                                                                                                                                     |
 | [`src/climate_scenarios.jl`](file:///c:/home/jae/projects/ParticleTracking/src/climate_scenarios.jl)   | CMIP6 downscaling, PLD formulas, thermal mortality            | `ClimateScenarioDelta`, `get_climate_scenario`, `apply_climate_anomaly_to_stratification`, `temperature_dependent_pld`, `larval_thermal_mortality_rate`                                                                                                                                                                     |
 | [`src/simulation.jl`](file:///c:/home/jae/projects/ParticleTracking/src/simulation.jl)                 | Time integration, adaptive CFL, 4D output interpolation       | `setup_hydrodynamic_simulation`, `run_hydrodynamic_simulation!`, `create_flow_interpolator_from_jld2`, `compute_advective_cfl`, `find_latest_checkpoint`, `inspect_hydrodynamic_checkpoint`, `inspect_hydrodynamic_file` |
-| [`src/larval_behavior.jl`](file:///c:/home/jae/projects/ParticleTracking/src/larval_behavior.jl)       | DVM swimming, BBL shear, sinking, drift, tracking             | `initialize_larval_particles`, `larval_ascent_velocity`, `diel_vertical_migration_velocity`, `superpose_tidal_velocity`, `bbl_velocity_factor`, `larval_passive_sinking_velocity`, `update_larval_stage`, `evaluate_settlement_suitability`, `larval_transport_step`, `track_larval_cohort`, `canonicalize_trajectories`                  |
+| [`src/larval_behavior.jl`](file:///c:/home/jae/projects/ParticleTracking/src/larval_behavior.jl)       | DVM swimming, BBL shear, sinking, drift, tracking             | `initialize_larval_particles`, `larval_ascent_velocity`, `diel_vertical_migration_velocity`, , `bbl_velocity_factor`, `larval_passive_sinking_velocity`, `update_larval_stage`, `evaluate_settlement_suitability`, `larval_transport_step`, `track_larval_cohort`, `canonicalize_trajectories`                  |
 | [`src/empirical_analysis.jl`](file:///c:/home/jae/projects/ParticleTracking/src/empirical_analysis.jl) | Taylor dispersion, CFA polygons, recruitment connectivity     | `estimate_empirical_movement`, `compute_gridded_recruitment_metrics`, `compute_gridded_thermal_metrics`, `point_in_polygon`, `load_cfa_polygons`, `compute_empirical_connectivity`, `connectivity_transitions`, `export_larval_dispersal_netcdf`, `export_larval_dispersal_jld2`                                     |
-| [`src/voronoi_tessellation.jl`](file:///c:/home/jae/projects/ParticleTracking/src/voronoi_tessellation.jl) | Depth-stratified Voronoi areal units & demographic matrices | `VoronoiUnit`, `VoronoiTessellation`, `generate_depth_stratified_voronoi_units`, `find_voronoi_cell`, `find_voronoi_cells`, `compute_tesselated_connectivity_matrix`                                                                                                                                                      |
 | [`src/analysis/larval_storage.jl`](file:///c:/home/jae/projects/ParticleTracking/src/analysis/larval_storage.jl)         | GeoData analytical backend & ensemble averaging                | `open_storage`, `close_storage`, `save_simulation_run!`, `load_run_configuration`, `list_simulation_runs`, `load_trajectories_df`, `load_connectivity_matrix`, `compare_scenarios`, `compute_ensemble_model_average`                                                                                         |
 | [`src/visualization.jl`](file:///c:/home/jae/projects/ParticleTracking/src/visualization.jl)           | CairoMakie figures, spatiotemporal video animations & Leaflet dashboard | `plot_particle_trajectories`, `plot_dvm_depth_profiles`, `plot_larval_dispersal_density`, `plot_empirical_movement_field`, `plot_connectivity_matrix`, `plot_thermal_exposure_map`, `plot_recruitment_summary`, `plot_climate_scenario_comparison`, `plot_hydrodynamic_field`, `plot_hydrodynamic_advection`, `plot_hydrodynamic_tracers`, `plot_hydrodynamic_stratification`, `plot_hydrodynamic_diffusion`, `plot_hydrodynamic_section`, `plot_hydrodynamic_timeseries`, `animate_hydrodynamic_field`, `animate_hydrodynamic_dashboard`, `export_interactive_tracks_html`, `plot_interactive_trajectories_map` |
 
@@ -117,7 +114,7 @@ ParticleTracking/
 
 The regional hydrodynamic model ([Oceananigans.jl](https://github.com/CliMA/Oceananigans.jl)) integrates the 3D hydrostatic Boussinesq primitive equations on a spherical latitude-longitude coordinate grid $(\lambda, \phi, z)$:
 
-$$\frac{\partial \boldsymbol{u}_h}{\partial t} + (\boldsymbol{u} \cdot \nabla) \boldsymbol{u}_h + f \hat{\boldsymbol{k}} \times \boldsymbol{u}_h = -\frac{1}{\rho_0} \nabla_h p + \nabla_h \cdot (\nu_h \nabla_h \boldsymbol{u}_h) + \frac{\partial}{\partial z}\left(\nu_v \frac{\partial \boldsymbol{u}_h}{\partial z}\right) + \boldsymbol{F}_{\text{tide}}$$
+$$\frac{\partial \boldsymbol{u}_h}{\partial t} + (\boldsymbol{u} \cdot \nabla) \boldsymbol{u}_h + f \hat{\boldsymbol{k}} \times \boldsymbol{u}_h = -\frac{1}{\rho_0} \nabla_h p + \nabla_h \cdot (\nu_h \nabla_h \boldsymbol{u}_h) + \frac{\partial}{\partial z}\left(\nu_v \frac{\partial \boldsymbol{u}_h}{\partial z}\right) $$
 
 $$\frac{\partial p}{\partial z} = -\rho g = b \rho_0$$
 
@@ -134,7 +131,8 @@ where:
 - $b = -g(\rho - \rho_0)/\rho_0$ is buoyancy computed via `SeawaterBuoyancy`;
 - $\boldsymbol{\kappa}_T, \boldsymbol{\kappa}_S$ are turbulent thermal and salt diffusivities;
 - $\boldsymbol{\kappa}_T, \boldsymbol{\kappa}_S$ are turbulent thermal and salt diffusivities;
-- $\boldsymbol{F}_{\text{tide}}$ is the astronomical tidal momentum body forcing;
+- the tide is carried in the stored flow field, applied by the ocean half with TPXO9
+  boundary forcing;
 - Bottom momentum drag incorporates linear Rayleigh and quadratic drag: $\boldsymbol{F}_{\text{drag}} = -(r_{\text{drag}} + C_d |\boldsymbol{u}_h|) \boldsymbol{u}_h$.
 
 ---
@@ -155,9 +153,12 @@ where volumetric heat capacity $\rho_0 c_p \approx 1025.0 \times 3990.0 \approx 
 
 ---
 
-### 3.3 Astronomical Tidal Body Forcing, Spring–Neap Cycles & Mixing Fronts
+### 3.3 Tidal Mixing Fronts
 
-Barotropic tidal harmonics (e.g. $M_2$ semi-diurnal, $\tau = 12.42\text{ h}$; $S_2$ solar semi-diurnal, $\tau = 12.00\text{ h}$) are introduced via bottom-drag-compensated momentum body forcing accelerations $\boldsymbol{F}_{\text{tide}} = (F_u, F_v)$ (Egbert & Erofeeva, 2002):
+The tide enters through the ocean half, which drives the barotropic mode with TPXO9 boundary
+forcing (placement = :boundary), so the stored flow field already carries the real $M_2$ and $S_2$
+harmonics and the spring–neap beat cycle they beat against. This half adds no tidal term of its
+own: superposing one on top of the stored field would double-count it.
 
 $$F_u(\lambda, \phi, z, t) = \sum_{k} U_k \sqrt{\omega_k^2 + r_{\text{drag}}^2} \cos(\omega_k t + \phi_{k,u})$$
 
@@ -201,7 +202,7 @@ where $H_{\text{mix}} = 30.0\text{ m}$ is the epipelagic mixed layer depth.
 
 Larval trajectories are governed by the stochastic Langevin equation integrated via the Euler-Maruyama scheme (North et al., 2009), enhanced with bottom boundary layer shear, passive gravitational sinking, and diffusive pseudo-drift (Hunter 1993; Visser 1997):
 
-$$\boldsymbol{x}_h^{n+1} = \boldsymbol{x}_h^n + \left[ f_{\text{bbl}}(z^n) \boldsymbol{u}_h(\boldsymbol{x}^n, t^n) + \boldsymbol{u}_{\text{tide}}(\boldsymbol{x}^n, t^n) \right] \Delta t + \sqrt{2 \kappa_h \Delta t} \, \boldsymbol{\xi}_h^n$$
+$$\boldsymbol{x}_h^{n+1} = \boldsymbol{x}_h^n + \left[ f_{\text{bbl}}(z^n) \boldsymbol{u}_h(\boldsymbol{x}^n, t^n) \right] \Delta t + \sqrt{2 \kappa_h \Delta t} \, \boldsymbol{\xi}_h^n$$
 
 $$z^{n+1} = z^n + \left[ w(\boldsymbol{x}^n, t^n) + w_{\text{swim}}(z^n, t^n) + w_{\text{sink}}(\text{stage}) + \frac{\partial \kappa_v}{\partial z} \right] \Delta t + \sqrt{2 \kappa_v\left(z^n + \frac{1}{2}\frac{\partial \kappa_v}{\partial z}\Delta t\right) \Delta t} \, \xi_z^n$$
 
@@ -336,14 +337,9 @@ ref_wind_u = 8.5                    # Baseline 10m zonal wind speed (m/s)
 ref_wind_v = 3.2                    # Baseline 10m meridional wind speed (m/s)
 
 [tides]
-enable_tides = true                 # Astronomical tidal forcing (M2 + S2)
-constituents = ["M2", "S2"]         # Tidal constituents (:M2, :S2 for spring-neap envelope)
-tidal_u_amp = 0.25                  # Semi-major M2 tidal amplitude (m/s)
-tidal_v_amp = 0.12                  # Semi-minor M2 tidal amplitude (m/s)
-s2_u_amp = 0.11                     # Semi-major S2 tidal amplitude (m/s)
-s2_v_amp = 0.05                     # Semi-minor S2 tidal amplitude (m/s)
-tidal_period = 44712.0              # M2 tidal period (seconds, ~12.42 hours)
-tidal_phase = 0.0                   # Initial tidal phase (radians)
+# The tide is carried by GeoOceanModel's stored flow field (TPXO9 boundary forcing).
+# GeoLarvalTracking reads it from the store and superposes nothing on top, so there
+# are no tidal settings to make here.
 
 [climate]
 scenario = "historical"             # "historical", "ssp126", "ssp245", "ssp585", "mhw"
@@ -401,11 +397,8 @@ settlement_max_temp = 6.0           # Maximum benthic temperature for settlement
 
 [storage]
 storage_backend = "zarr"            # Storage backend ("zarr" or "geoparquet")
-zarr_path = "outputs/particle_tracking.zarr" # Zarr analytical storage path
-
-[hardware]
-use_gpu = false                     # NVIDIA CUDA GPU hardware acceleration
-fallback_to_cpu = true              # Fallback to multi-threaded CPU if GPU is absent
+output_dir = "../lakehouse/GeoLarvalTracking/default" # Where the run writes
+ocean_model = "../lakehouse/GeoOceanModel/default/hydrodynamics.zarr" # The ocean store read
 
 [visualization]
 interactive_map = true              # Export interactive HTML5 Leaflet map
@@ -418,9 +411,7 @@ anim_overlay_particles = false      # Synchronously overlay active Lagrangian pa
 anim_output_path = ""               # Custom output file path (e.g. "outputs/flow.mp4"); auto-named if empty
 title = "Scotian Shelf Snow Crab Larval Dispersal & Demographic Connectivity"
 
-[paths]
-output_dir = "outputs"              # Target directory for artifacts and figures
-input_dir = "inputs"                # Directory for bathymetry, winds, polygons
+[runtype]
 seed = 42                           # RNG seed for reproducible stochastic runs
 ```
 
@@ -543,18 +534,15 @@ println(grid)
 ```
 ---
 
-## 4. Hydrodynamic Model with Optional Astronomical Tidal Forcing
+## 4. Hydrodynamic Model, with the Tide Carried by the Ocean Half
 
 Construct a `HydrostaticFreeSurfaceModel` with Coriolis acceleration, SeawaterBuoyancy,
 active temperature and salinity tracers, surface wind stress boundary conditions, and
 optional barotropic tidal body forcing ($M_2, S_2$):
 
 ```julia
-# 1. (Optional) Configure barotropic M2 semi-diurnal tidal momentum body forcing
-tides = build_tidal_body_forcing(
-  constituents=[:M2],
-  u_amplitudes=Dict(:M2 => 0.25),
-  v_amplitudes=Dict(:M2 => 0.12))
+# 1. The tide comes from the ocean half's store -- TPXO9 boundary forcing there.
+#    Nothing to configure on this side.
   
 # 2. Instantiate hydrostatic model with wind stress and tidal forcing
 model = build_hydrodynamic_model(
@@ -674,8 +662,8 @@ $$\text{CFL}_{\text{total}} = \Delta t \left( \frac{\max |u|}{\Delta x} + \frac{
 ### 6.2 Open Boundary Forcing and Sponge Masking Assumptions
 
 Regional boundary forcing requires distinguishing between interior momentum accelerations and boundary velocity targets:
-- **Interior Tidal Acceleration**: Added to the momentum equation as body force tendencies $\boldsymbol{F}_{\text{tide}} = (F_u, F_v)$ in $\text{m s}^{-2}$ incorporating bottom friction damping $r_{\text{drag}}$.
-- **Boundary Relaxation**: Open boundary conditions implemented via `Oceananigans.BoundaryConditions.Relaxation` prescribe target tidal velocity fields $\boldsymbol{u}_{\text{target}} = (u_{\text{tide}}, v_{\text{tide}})$ in $\text{m s}^{-1}$.
+- **Tidal Acceleration**: Applied in the ocean half (TPXO9 boundary forcing) and carried in the stored flow field this half reads.
+- **Boundary Relaxation**: Open boundary conditions implemented via `Oceananigans.BoundaryConditions.Relaxation` prescribe target velocity fields in $\text{m s}^{-1}$.
 - **Selective Sponge Zones**: Relaxation damping masks are applied to true oceanic boundaries (`:east`, `:south`, `:west`), avoiding land-adjacent boundaries (`:north`) where artificial inflow would induce spurious gravity waves.
 
 
@@ -784,41 +772,6 @@ export_larval_dispersal_jld2(
   "outputs/larval_dispersal_analysis.jld2",
   trajectories=trajectories,
   strata_definitions=cfa_definitions)
-```
-
-### 8.1 Depth-Stratified Multi-Resolution Voronoi Tessellation
-
-To achieve sub-2 km spatial resolution in the primary snow crab nursery grounds ($50\text{--}350\text{ m}$ depth) without imposing prohibitive time-stepping penalties on the 3D Navier-Stokes solver, `ParticleTracking.jl` couples Eulerian circulation with a depth-stratified Voronoi tessellation:
-
-$$\text{Pr}(\text{sample} \in \text{stratum}) = \begin{cases} 0.80, & \text{Core Stratum } (-350\text{ m} \le z_{\text{bed}} \le -50\text{ m}) \\ 0.10, & \text{Shallow Stratum } (-50\text{ m} < z_{\text{bed}} \le 0\text{ m}) \\ 0.10, & \text{Deep Stratum } (z_{\text{bed}} < -350\text{ m}) \end{cases}$$
-
-Poisson-disc rejection thresholds prevent point clustering and enforce minimum spatial separation:
-- **Core**: $d_{\min} \ge 1.5\text{ km}$
-- **Shallow**: $d_{\min} \ge 5.0\text{ km}$
-- **Deep**: $d_{\min} \ge 10.0\text{ km}$
-
-```julia
-# 1. Generate N=5000 depth-stratified Voronoi units from bathymetry
-tess = generate_depth_stratified_voronoi_units(
-  bathy_interpolator,
-  lon_range=(-68.0, -57.0),
-  lat_range=(42.0, 47.0),
-  n_units=5000,
-  prob_core=0.8, prob_shallow=0.1, prob_deep=0.1,
-  min_res_core_km=1.5, min_res_shallow_km=5.0, min_res_deep_km=10.0)
-
-println("Generated $(length(tess.units)) Voronoi units across Scotian Shelf.")
-
-# 2. Compute high-resolution N x N transition probability matrix
-tess_conn = compute_tesselated_connectivity_matrix(
-  trajectories,
-  tess,
-  successful_only=true)
-
-println("Mean local self-retention across Voronoi units: ", 
-        round(mean(tess_conn.retention_indices), digits=4))
-println("Macro-strata transition matrix (shallow, core, deep):")
-display(round.(tess_conn.strata_matrix, digits=3))
 ```
 
 ---
@@ -1219,7 +1172,7 @@ configuration file at [`inputs/ParticleTracking.config`](file:///c:/home/jae/pro
 - `[domain]`: Bounding coordinates ($\lambda_{\min}, \lambda_{\max}, \phi_{\min}, \phi_{\max}, z_{\min}, z_{\max}$).
 - `[grid]`: Numerical grid dimensions ($N_x, N_y, N_z$).
 - `[data]`: Environmental data mode (`synthetic` vs `real`), dataset IDs, and synthetic shelf parameters.
-- `[tides]`: Barotropic tidal forcing options ($M_2$ constituent amplitude, period, phase).
+- `[tides]`: Removed. The tide is carried by the ocean half's stored flow field.
 - `[climate]`: Climate scenario selection (`ssp126`, `ssp245`, `ssp585`, `mhw`), projection and baseline years.
 - `[hydrodynamics]`: Oceananigans integration duration, initial time step, adaptive CFL target, periodic checkpointing (`enable_checkpoint`), checkpoint directory, and automatic restart pickup (`auto_restart`).
 - `[biology]`: Larval cohort size ($N$), drift duration, tracking step, minimum depth ($100\text{ m}$),
@@ -1228,10 +1181,9 @@ configuration file at [`inputs/ParticleTracking.config`](file:///c:/home/jae/pro
 - `[dvm]`: Stage-specific Diel Vertical Migration daytime/nighttime target depths and swimming speeds.
 - `[molting_and_settlement]`: Degree-day thresholds ($150, 310, 510\text{ DD}$), thermal mortality
   parameters, and benthic nursery suitability windows ($-250\text{ m} \le z \le -50\text{ m}$, $T \le 6^\circ\text{C}$).
-- `[storage]`: GeoData analytical storage persistence and checkpointing.
-- `[hardware]`: NVIDIA CUDA GPU hardware acceleration and automatic CPU fallback.
+- `[storage]`: GeoData analytical storage persistence, the run's output directory, and the realized ocean store it reads.
 - `[visualization]`: Interactive HTML5 Leaflet map export, spatiotemporal hydrodynamic animations (MP4/GIF), diagnostic field variable selection, continuous depth targeting, framerate control, larval particle overlays, and custom output file destination paths.
-- `[paths]`: File system directories (`inputs`, `outputs`) and pseudorandom seed.
+- `[runtype]`: The run's identity and its master RNG seed.
 
 ```julia
 # Load centralized configuration
@@ -1453,7 +1405,6 @@ for cfg in cohort_configs
         κ_h = 10.0,
         κ_v = 1e-4,
         is_lat_lon = true,
-        enable_tides = true,
         enable_molting = true,
         enable_bbl = true,
         enable_sinking = true,
@@ -1724,8 +1675,8 @@ The test sets cover:
 2. Synthetic data generation and NetCDF dataset inspection.
 3. Immersed boundary grid geometry and Coriolis parameters.
 4. Hydrodynamic model configuration, boundary conditions, and CMIP6 scenarios.
-5. Tidal dynamics, harmonic body forcing, and Simpson-Hunter stratification.
-6. Larval DVM, tidal velocity superposition, and settlement environmental filters.
+5. Simpson-Hunter tidal-mixing stratification diagnostics over the shelf banks.
+6. Larval DVM and settlement environmental filters.
 7. Lagrangian particle tracking, numerical integration, and marine land exclusion.
 8. Empirical movement velocity and turbulent diffusivity estimation.
 9. Gridded recruitment metrics and thermal exposure analysis.

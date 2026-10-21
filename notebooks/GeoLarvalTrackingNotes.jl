@@ -97,8 +97,12 @@ The trajectory of each individual larva $p$ is integrated using the stochastic L
 via the Euler-Maruyama scheme:
 
 ```math
-\boldsymbol{x}_h^{n+1} = \boldsymbol{x}_h^n + \left[ f_{\text{bbl}}(z^n) \boldsymbol{u}_h(\boldsymbol{x}^n, t^n) + \boldsymbol{u}_{\text{tide}}(\boldsymbol{x}^n, t^n) \right] \Delta t + \sqrt{2 \kappa_h \Delta t} \, \boldsymbol{\xi}_h^n
+\boldsymbol{x}_h^{n+1} = \boldsymbol{x}_h^n + \left[ f_{\text{bbl}}(z^n) \boldsymbol{u}_h(\boldsymbol{x}^n, t^n) \right] \Delta t + \sqrt{2 \kappa_h \Delta t} \, \boldsymbol{\xi}_h^n
 ```
+
+The horizontal velocity $\boldsymbol{u}_h$ is read from the ocean half's store, which already
+carries the real tidal cycle: the ocean model drives it with TPXO9 boundary forcing, so no
+tidal term is added here. Adding one would double-count the tide.
 
 ```math
 z^{n+1} = z^n + \left[ w(\boldsymbol{x}^n, t^n) + w_{\text{swim}}(z^n, t^n) + w_{\text{sink}}(\text{stage}) + \frac{\partial \kappa_v}{\partial z} \right] \Delta t + \sqrt{2 \kappa_v \left(z^n + \frac{1}{2}\frac{\partial \kappa_v}{\partial z}\Delta t\right) \Delta t} \, \xi_z^n

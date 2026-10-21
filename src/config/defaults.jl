@@ -55,8 +55,9 @@ Run with one of:
 
 or copy one to ParticleTracking.toml at the project root, which the loader picks up
 automatically. For a study of your own, copy the closest config and edit the sections the
-run depends on: [data] for datasets, [domain] and [grid] for the box and resolution,
-[tides] for tidal forcing, and [biology] for larval parameters."""
+run depends on: [data] for datasets, [domain] and [grid] for the box and resolution, and
+[biology] for larval parameters.
+"""
 
 """
     study_domain_ranges(cfg) -> NamedTuple
@@ -176,17 +177,6 @@ function get_default_configuration()::Dict{String, Any}
             "drag_formulation" => "garratt_1977",
             "bulk_heat_flux" => true
         ),
-        "tides" => Dict{String, Any}(
-            # Tide is carried by GeoOceanModel's stored flow field (TPXO9 boundary forcing).
-            # GeoLarvalTracking reads it from the store; do NOT superpose analytic tide on top
-            # — that would double-count.
-            "enable_tides" => false,
-            "constituents" => ["M2"],
-            "tidal_u_amp" => 0.25,
-            "tidal_v_amp" => 0.12,
-            "tidal_period" => 44712.0,
-            "tidal_phase" => 0.0
-        ),
         "climate" => Dict{String, Any}(
             "scenario" => "ssp245",
             "projection_year" => 2050,
@@ -241,43 +231,13 @@ function get_default_configuration()::Dict{String, Any}
             "settlement_max_depth" => -50.0,
             "settlement_max_temp" => 6.0
         ),
-         "storage" => Dict{String, Any}(
-             "output_path" => joinpath("outputs", "particle_tracking.jld2"),
-             "storage_backend" => "zarr",
-             "enable_checkpoint" => true,
-             "checkpoint_prefix" => "checkpoint_ParticleTracking",
-             "checkpoint_schedule_seconds" => 21600.0,
-             "checkpoint_dir" => "outputs/checkpoints",
-             "checkpoint_cleanup" => true
-         ),
-        "tessellation" => Dict{String, Any}(
-            "enable_voronoi" => false,
-            "n_units" => 5000,
-            "prob_core" => 0.8,
-            "prob_shallow" => 0.1,
-            "prob_deep" => 0.1,
-            "min_res_core_km" => 1.5,
-            "min_res_shallow_km" => 5.0,
-            "min_res_deep_km" => 10.0,
-            # Depth band edges as positive depths below the surface. Core is the mid-shelf
-            # nursery, shallow the nearshore strip, deep everything below the shelf break.
-            "core_depth_min" => 50.0,
-            "core_depth_max" => 350.0,
-            "shallow_depth_min" => 0.0,
-            "shallow_depth_max" => 50.0,
-            "deep_depth_min" => 350.0,
-            "deep_depth_max" => 6000.0,
-            "slope_weighting" => true,
-            "slope_factor" => 15.0
-        ),
-        "hardware" => Dict{String, Any}(
-            "use_gpu" => false,
-            # Off by default, and deliberately. A GPU request that cannot be honoured must
-            # fail loudly: silently running the CPU path instead would leave
-            # `resolved_config.toml` recording `use_gpu = true` for a run that never touched
-            # a GPU, which is the same silent lie the provenance file exists to prevent. Set
-            # it to true only on a machine where degrading is genuinely acceptable.
-            "fallback_to_cpu" => false
+        "storage" => Dict{String, Any}(
+            "output_dir" => "",
+            "storage_backend" => "zarr",
+            "enable_checkpoint" => true,
+            "checkpoint_prefix" => "checkpoint_ParticleTracking",
+            "checkpoint_schedule_seconds" => 21600.0,
+            "checkpoint_cleanup" => true
         ),
         "visualization" => Dict{String, Any}(
             "interactive_map" => true,
@@ -290,7 +250,7 @@ function get_default_configuration()::Dict{String, Any}
             "anim_output_path" => "",
             "title" => "Regional Marine Lagrangian Particle Tracking & Dispersion"
         ),
-        "paths" => Dict{String, Any}(
+        "runtype" => Dict{String, Any}(
             "seed" => 42
         )
     )

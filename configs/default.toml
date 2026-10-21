@@ -1,195 +1,147 @@
 # =============================================================================
 # GeoLarvalTracking - Default Demonstration Configuration
 # =============================================================================
-# Baseline configuration for Lagrangian larval drift, active vertical behavior,
-# phenological development (molting), and benthic habitat settlement.
+# The larval half of a run: Lagrangian drift, diel vertical migration, degree-day
+# molting, thermal mortality, and settlement on the nursery grounds.
 #
 #   julia --project=. GeoLarvalTrackingRun.jl --config=configs/default.toml
+#
+# This file is the record of the model that ran. Every parameter the package reads
+# is written here with the value the run used, so a run can be reproduced from its
+# configuration and nothing else. Two rules follow from that:
+#
+#   * A key that is not in this file is not a setting. It is a comment in TOML
+#     syntax, and it lies to whoever edits the file next.
+#   * A value here is the truth. The code reads it; the code does not hold a
+#     competing copy of it.
+#
+# The ocean half is configured separately, in GeoOceanModel's own configuration
+# files. The two are coupled by PATH, not by a shared file: `[storage] ocean_model`
+# names the realized ocean store this run tracks through, and the run reads that
+# store's own coordinates. The ocean's domain, grid and forcing are therefore not
+# repeated here -- they belong to the ocean run, and repeating them would be one
+# more place for the two halves to disagree.
 # =============================================================================
 
+[storage]
+# Where this run reads from and writes to. Both live here, in one section, with one
+# name each: two sections naming the same run's places is two chances for them to
+# disagree, and the disagreement is silent.
+#
+# Relative paths are resolved against this package's root, so `../lakehouse/...` is
+# the sibling lakehouse and `lakehouse/...` the in-project one; either form works.
+output_dir = "../lakehouse/GeoLarvalTracking/default"
+# The realized ocean store this run tracks through: the `hydrodynamics.zarr`
+# directory the ocean half wrote, not the run directory that contains it. A
+# command-line `--hydro-file` overrides this.
+ocean_model = "../lakehouse/GeoOceanModel/default/hydrodynamics.zarr"
+# The backend the larval data is written in.
+storage_backend = "zarr"
+# Whether the trajectory store is written at all.
+enable_zarr = true
+# Field-output cadence, in seconds. Distinct from the checkpoint cadence below:
+# the two may legitimately differ.
+output_schedule_seconds = 21600.0
+# Whether restart archives are written.
+enable_checkpoint = true
+# Filename prefix of the restart archives.
+checkpoint_prefix = "checkpoint_ParticleTracking"
+# State-checkpoint cadence, in seconds.
+checkpoint_schedule_seconds = 21600.0
+# Whether older restart archives are purged when a new one is written.
+checkpoint_cleanup = true
+# A tag appended to the run's output names. Empty means "no tag".
+run_id = ""
+# The trajectory store and the restart archives are NOT named here. They are
+# derived from `output_dir` -- <output_dir>/particle_tracking.zarr and
+# <output_dir>/checkpoints -- so that a run's outputs are all in one place and
+# cannot be split across two directories. The resolved paths are recorded in the
+# run's `resolved_config.toml`.
+
 [domain]
-# Geographic bounding box in degrees (WGS84, EPSG:4326)
-lon_min = -71.0               # Western boundary longitude (°E)
-lon_max = -53.0               # Eastern boundary longitude (°E)
-lat_min = 40.0                # Southern boundary latitude (°N)
-lat_max = 48.5                # Northern boundary latitude (°N)
-z_min = -3500.0               # Maximum bathymetric water depth (m, negative down)
-z_max = 0.0                   # Free surface elevation (m)
-buffer_km = 10.0              # Domain buffer margin in kilometres
-
-[grid]
-# Hydrodynamic background grid specifications
-nx = 50                       # Zonal grid cell count
-ny = 50                       # Meridional grid cell count
-nz = 10                       # Vertical layer count
-vertical_stretching_mode = "oceananigans" # Vertical stretching ("oceananigans", "tanh")
-nz_above = 0                  # Layers allocated to upper shelf stratum
-vertical_break_depth = -400.0 # Depth separating shelf from deep basin (m)
-vertical_grid_file = ""       # Optional CSV file specifying vertical layer faces
-depths = []                   # Explicit vertical faces (empty = use nz & mode)
-
-[bathymetry]
-# Analytical shelf geometry
-inshore_depth = -20.0         # Water depth at inshore boundary (m)
-shelf_slope = 500.0           # Total rise across the shelf (m)
-mask_bay_of_fundy = false     # Damp Bay of Fundy resonance if active
-
-[data]
-# Environmental data sources and assimilation settings
-bathy_source = "etopo2022"    # Bathymetry provider: "etopo2022", "nwa_bathymetry"
-coastline_source = "natural_earth_10m" # Coastline provider
-wind_source = "open_meteo"    # Surface wind forcing provider
-wind_time_iso = "2020-06-01T00:00:00Z" # Epoch for wind forcing
-hydrography_source = "synthetic" # Ocean hydrography provider ("woa23", "glorys12v1", "synthetic")
-hydrography_month = 0         # Month index (0 = annual climatology)
-
-[atmosphere]
-# Atmospheric forcing
-source = "era5_climatology"   # "open_meteo", "era5_climatology", or "synthetic"
-bulk_heat_flux = true         # Compute bulk sensible/latent heat fluxes
-
-[boundaries]
-# Lateral open boundary conditions
-method = "relaxation"         # Lateral boundary condition method
-obc_type = "flather_chapman"  # Radiation boundary formulation
-ocean_boundary_source = "glorys12v1" # Target tracer and velocity state provider
-sponge_layer_width = 0.35     # Width of lateral sponge zone in degrees
-sponge_timescale_seconds = 3600.0 # Relaxation timescale in seconds (1 hour)
-u_inflow = -0.15              # Zonal inflow velocity (m/s)
-v_inflow = 0.05               # Meridional inflow velocity (m/s)
-
-[tides]
-# Astronomical tidal body and boundary forcing
-enable_tides = true           # Enable astronomical tidal forcing
-tides_source = "tpxo9"        # "tpxo9", "tpxo9_atlas", or "analytic"
-tidal_constituents = ["M2", "S2"] # Active tidal constituents
-tidal_u_amp = 0.25            # M2 zonal velocity amplitude (m/s)
-tidal_v_amp = 0.12            # M2 meridional velocity amplitude (m/s)
-s2_u_amp = 0.11               # S2 zonal velocity amplitude (m/s)
-s2_v_amp = 0.05               # S2 meridional velocity amplitude (m/s)
-
-[climate]
-# Climate scenario configuration
-scenario = "ssp245"           # Climate scenario ("climatology", "ssp126", "ssp245", "ssp585")
-projection_year = 2050        # Target simulation year
-
-[hydrodynamics]
-# Numerical solver and flow field controls
-sim_duration_hours = 12.0     # Hydrodynamic simulation duration in hours
-sim_dt_seconds = 120.0        # Numerical time step in seconds
-min_dt_seconds = 2.0          # Minimum allowable time step floor (seconds)
-max_dt_seconds = 120.0        # Maximum allowable time step ceiling (seconds)
-adaptive_cfl = true           # Enable adaptive time stepping
-target_cfl = 0.2              # Target CFL condition limit
-target_wave_cfl = 0.20        # Target wave CFL limit
-surface_heat_flux = 50.0      # Prescribed surface heat flux (W/m^2)
-max_current_speed = 3.0       # Current velocity ceiling in m/s
-max_flow_snapshots = 400      # Snapshot memory retention limit
-allow_analytical_fallback = false # Fall back to synthetic jet if flow unavailable
-hydro_model_file = "../lakehouse/GeoOceanModel/default" # Target ocean flow directory
-hydro_only = false            # Run hydrodynamics only
-track_only = false            # Run particle tracking only using flow fields
-reuse_hydro = false           # Reuse existing flow fields if found on disk
-overwrite = false             # Overwrite existing outputs if present
+# The box the larvae are released into, and the region the run's outputs describe.
+# These are the ocean run's own domain: the coupling is by path, and a larval
+# release box that is not the box the ocean covered would put larvae in water the
+# model never simulated. They match GeoOceanModel's `default.toml`.
+lon_min = -61.2               # Western boundary longitude (°E)
+lon_max = -59.6               # Eastern boundary longitude (°E)
+lat_min = 45.0                # Southern boundary latitude (°N)
+lat_max = 46.9                # Northern boundary latitude (°N)
+z_min = -1500.0               # Deepest water of the coupled domain (m, negative down)
+z_max = 0.0                   # Free surface (m)
+# Margin around the domain kept free of releases, in kilometres.
+buffer_km = 20.0
 
 [biology]
-# Lagrangian larval particle tracking and stochastic biology
-n_particles = 300             # Number of Lagrangian larval particles
-track_duration_days = 3.0     # Drift tracking duration in days
-track_dt_seconds = 300.0      # Particle integration time step in seconds
-min_seabed_depth = 20.0       # Minimum seabed depth for release units (m)
-buffer_km = 10.0              # Domain buffer margin (km)
+# The cohort, its release, and its diffusion.
+n_particles = 100             # Number of larvae released
+track_duration_days = 5.0     # How long the cohort is tracked, in days
+track_dt_seconds = 300.0      # Lagrangian integration time step (s)
+min_seabed_depth = 100.0      # Minimum water depth for a release site (m)
 diffusivity_h = 10.0          # Horizontal eddy diffusivity (m^2/s)
 diffusivity_v = 0.0001        # Vertical eddy diffusivity (m^2/s)
-release_depth_mode = "bottom" # Release stratum: "bottom", "range", or "surface"
-bottom_release_offset = [0.5, 3.0] # Elevation range above seabed for release (m)
-enable_initial_ascent = true  # Post-hatch directed upward swimming
-ascent_speed = 0.010          # Directed upward ascent speed (m/s)
-ascent_target_depth = -10.0   # Target epipelagic depth for ascent (m)
-settlement_stochastic = true  # Draw settlement probabilistically from HSI
-cv_molt = 0.25                # Degree-day molting threshold CV
-cv_mortality = 0.25           # Larval mortality CV
-cv_settlement = 0.25          # Habitat settlement CV
+# Where in the water column a larva is released: "bottom", "range" or "surface".
+release_depth_mode = "bottom"
+# Height above the seabed for a benthic release, as (low, high) in metres.
+bottom_release_offset = [0.5, 3.0]
+# Whether newly released larvae swim up to the surface mixed layer first.
+enable_initial_ascent = true
+# Ascent swimming speed (m/s) and the depth it aims for (m).
+ascent_speed = 0.010
+ascent_target_depth = -10.0
+# Whether settlement is drawn probabilistically from the habitat suitability index
+# rather than decided by the suitability value itself.
+settlement_stochastic = true
+# Coefficients of variation of the three per-larva traits: the developmental
+# threshold, the mortality hazard, and the settlement index. Zero would make the
+# cohort deterministic.
+cv_molt = 0.25
+cv_mortality = 0.25
+cv_settlement = 0.25
 
 [dvm]
-# Diel Vertical Migration behavioral regime
-enable_dvm = true             # Enable diurnal vertical migration
-zoea1_day_depth = -50.0       # Daytime target depth for Zoea I (m)
-zoea1_night_depth = -10.0     # Nighttime target depth for Zoea I (m)
-zoea2_day_depth = -55.0       # Daytime target depth for Zoea II (m)
-zoea2_night_depth = -8.0      # Nighttime target depth for Zoea II (m)
-megalopa_day_depth = -120.0   # Daytime target depth for Megalopa (m)
-megalopa_night_depth = -60.0  # Nighttime target depth for Megalopa (m)
-zoea2_depth_factor = 1.0      # Depth scaling multiplier for Zoea II
-megalopa_swim_factor = 1.0    # Swimming speed multiplier for Megalopa
+# Diel Vertical Migration: the depth the cohort holds by day and by night, per
+# stage, and the swim-speed multipliers that scale the two later stages.
+enable_dvm = true
+zoea1_day_depth = -50.0       # Zoea I, daytime target depth (m)
+zoea1_night_depth = -10.0     # Zoea I, nighttime target depth (m)
+zoea2_day_depth = -55.0       # Zoea II, daytime target depth (m)
+zoea2_night_depth = -8.0      # Zoea II, nighttime target depth (m)
+megalopa_day_depth = -120.0   # Megalopa, daytime target depth (m)
+megalopa_night_depth = -60.0  # Megalopa, nighttime target depth (m)
+zoea2_depth_factor = 1.2      # Zoea II swim-speed multiplier
+megalopa_swim_factor = 1.5    # Megalopa swim-speed multiplier
 
 [molting_and_settlement]
-# Larval phenological development and settlement
-enable_molting = true         # Track degree-day accumulation and ecdysis
-t_base = -1.5                 # Physiological degree-day base temperature (°C)
-dd_zoea1_to_zoea2 = 65.0      # Degree-days required to molt from Zoea I to Zoea II
-dd_zoea2_to_megalopa = 130.0  # Degree-days required to molt from Zoea II to Megalopa
-dd_megalopa_to_settle = 200.0 # Degree-days required for Megalopa to reach competence
-settlement_min_depth = -350.0 # Deep boundary for benthic settlement (m)
-settlement_max_depth = -20.0  # Shallow boundary for benthic settlement (m)
-settlement_max_temp = 6.0     # Maximum admissible bottom temperature for settlement (°C)
-mortality_base = 0.01         # Baseline daily mortality hazard rate (day^-1)
-mortality_thermal_threshold = 15.0 # Thermal stress threshold temperature (°C)
-mortality_thermal_sensitivity = 0.02 # Incremental mortality rate per °C above threshold
-mortality_cold_threshold = 0.0 # Cold stress threshold temperature (°C)
-mortality_cold_sensitivity = 0.01 # Incremental mortality rate per °C below cold threshold
-cv_molt = 0.25                # Molt threshold variance
-cv_mortality = 0.25           # Mortality hazard variance
-
-[tessellation]
-# Voronoi spatial unit partitioning for connectivity analysis
-enable_voronoi = true         # Generate Voronoi connectivity mesh
-n_units = 120                 # Number of discrete spatial units to generate
-prob_core = 0.8               # Sampling probability weight for core depth stratum
-prob_shallow = 0.1            # Sampling probability weight for shallow stratum
-prob_deep = 0.1               # Sampling probability weight for deep stratum
-min_res_core_km = 1.5         # Minimum separation distance in core stratum (km)
-min_res_shallow_km = 5.0      # Minimum separation distance in shallow stratum (km)
-min_res_deep_km = 10.0        # Minimum separation distance in deep stratum (km)
-shallow_depth_min = 0.0       # Shallow stratum minimum depth (m)
-shallow_depth_max = 50.0      # Shallow stratum maximum depth (m)
-core_depth_min = 50.0         # Core stratum minimum depth (m)
-core_depth_max = 350.0        # Core stratum maximum depth (m)
-deep_depth_min = 350.0        # Deep stratum minimum depth (m)
-deep_depth_max = 6000.0       # Deep stratum maximum depth (m)
-slope_weighting = true        # Refine cell spacing on steep bathymetric slopes
-slope_factor = 15.0           # Slope refinement multiplier
-
-[storage]
-# Output persistence and Lakehouse state archiving
-output_dir = "../lakehouse/GeoLarvalTracking/default" # Target Lakehouse output directory
-output_schedule_seconds = 21600.0 # Field-output interval (seconds, 6 hours)
-enable_zarr = true            # Persist Lagrangian larval trajectories to Zarr
-zarr_path = "outputs/particle_tracking.zarr" # Destination Zarr path
-storage_backend = "zarr"      # Persistence format ("zarr" or "geoparquet")
-enable_checkpoint = true      # Save simulation checkpointer state
-checkpoint_dir = ""           # Checkpoint folder (empty defaults to output_dir/checkpoints)
-checkpoint_prefix = "checkpoint_ParticleTracking" # Checkpoint filename prefix
-checkpoint_schedule_seconds = 0.0 # State checkpoint frequency in seconds (0 = match output)
-checkpoint_cleanup = true     # Automatically purge older intermediate checkpoints
-run_id = ""                   # Unique run identifier tag
+# Phenological development: the degree-day thresholds that move a larva between
+# stages, the mortality envelope, and the depths and temperature of the nursery
+# habitat it settles on.
+enable_molting = true
+t_base = -1.5                 # Development threshold temperature (°C)
+dd_zoea1_to_zoea2 = 65.0      # Degree-days for the Zoea I -> Zoea II molt (°C·d)
+dd_zoea2_to_megalopa = 130.0  # Degree-days for the Zoea II -> Megalopa molt (°C·d)
+dd_megalopa_to_settle = 200.0 # Degree-days for a Megalopa to become competent (°C·d)
+mortality_base = 0.02         # Baseline daily mortality hazard (day^-1)
+mortality_thermal_threshold = 7.0    # Temperature above which heat kills (°C)
+mortality_thermal_sensitivity = 0.015 # Extra mortality per °C above the threshold
+mortality_cold_threshold = -1.5       # Temperature below which cold kills (°C)
+mortality_cold_sensitivity = 0.01     # Extra mortality per °C below the threshold
+settlement_min_depth = -250.0 # Deepest edge of the settlement habitat (m)
+settlement_max_depth = -50.0  # Shallowest edge of the settlement habitat (m)
+settlement_max_temp = 6.0     # Warmest bottom temperature a larva will settle at (°C)
 
 [visualization]
-# Diagnostics, animations, and interactive mapping
-interactive_map = true        # Export interactive HTML5 Leaflet map
-animate_hydro = false         # Generate hydrodynamic animation
-anim_variable = "dashboard"   # Variable: "dashboard", "speed", "temperature", "eta"
-anim_fps = 10                 # Animation frames per second
-anim_format = "mp4"           # Video container format: "mp4", "gif", or "webm"
-anim_depth = -2.5             # Depth slice for 2D flow animation (m)
-anim_overlay_particles = false# Render particle positions on top of flow field
-anim_output_path = ""         # Custom destination path for animation video
+# What the run draws.
+interactive_map = true        # The interactive HTML5 Leaflet dashboard
+animate_hydro = false         # A hydrodynamic animation (off: it is expensive)
+anim_variable = "dashboard"   # Variable to animate: "dashboard", "speed", "temperature", "eta"
+anim_fps = 10                 # Animation frame rate
+anim_format = "mp4"           # Animation container: "mp4", "gif" or "webm"
+anim_depth = -2.5             # Depth slice for the 2-D flow animation (m)
+anim_overlay_particles = false # Draw the larvae on top of the flow field
+anim_output_path = ""         # Where the animation is written; empty means beside the figures
 
-[hardware]
-# Execution hardware
-use_gpu = false               # Whether to run hydrodynamics on NVIDIA GPU
-fallback_to_cpu = false       # Refuse silent fallback to CPU if GPU requested
-
-[paths]
-# Reproducibility
+[runtype]
+# What kind of run this is, and what makes it reproducible. The same section the ocean
+# half uses, so the two halves of a run describe themselves the same way.
 seed = 42                     # Master RNG seed

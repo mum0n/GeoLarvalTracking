@@ -4,10 +4,10 @@ module GeoLarvalTracking
 #  GeoLarvalTracking
 #
 #  Phase 6 of the ParticleTracking split (SPLIT_PLAN.md 1). This package owns the Lagrangian
-#  half: larval biology, DVM, molting, mortality, settlement, depth-stratified tessellation,
-#  larval storage, and the larval figures. It reads the ocean by LOCATION and by METADATA
-#  from the handover `GeoOceanModel.SimulationResult` describes, and imports nothing from
-#  GeoOceanModel -- there is no shared TOML and no import edge, by the contract in 1.
+#  half: larval biology, DVM, molting, mortality, settlement, larval storage, and the larval
+#  figures. It reads the ocean by LOCATION and by METADATA from the handover
+#  `GeoOceanModel.SimulationResult` describes, and imports nothing from GeoOceanModel -- there
+#  is no shared TOML and no import edge, by the contract in 1.
 #
 #  Everything here was moved from `ParticleTracking/src` unchanged, apart from the module name
 #  and the paths in `include`. Nothing was renamed.
@@ -30,6 +30,7 @@ using
 # GeoDataSources supplies the data layer for reading a coastline and for a bathymetry
 # product, which a seed-position filter needs to reject land. Nothing here fetches over the
 # network except through the layer that owns the network.
+using GeoData
 using GeoDataSources
 using GeoDataSources: available_data, DataSource
 
@@ -53,7 +54,6 @@ include("config/configuration.jl")
 include("data/store_reader.jl")
 include("driver.jl")
 include("biology/larval_behavior.jl")
-include("analysis/voronoi_tessellation.jl")
 include("analysis/larval_storage.jl")
 include("analysis/empirical_analysis.jl")
 include("output/visualization.jl")

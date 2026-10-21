@@ -6,8 +6,9 @@ using Statistics
     resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
 
 Resolve the target realized-simulation store path and name. If `opts.hydro_model_file` is
-specified it is used directly (or resolved relative to `opts.output_dir` when a bare name is
-given); if empty it is `joinpath(opts.output_dir, default_filename)`. The path is normally the
+specified it is used directly (or resolved against the package root when it is a path,
+or against `opts.output_dir` when it is a bare name); if empty it is
+`joinpath(opts.output_dir, default_filename)`. The path is normally the
 GeoData store the ocean half hands over as `--hydro-file`, though the name is left generic so
 it also covers a JLD2 file a caller names.
 
@@ -24,7 +25,19 @@ function resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::S
         return (full_path, default_filename)
     else
         raw = opts.hydro_model_file
-        full_path = isabspath(raw) || dirname(raw) != "" ? raw : joinpath(opts.output_dir, raw)
+        # A configured path is resolved against THIS PACKAGE'S ROOT, not against the
+        # working directory the run happened to be started from. `../lakehouse/...` must
+        # name the same store from every directory, and resolving it against the working
+        # directory made the same configuration read a different simulation depending on
+        # where it was run -- or none at all. A bare name is still this run's own output
+        # directory, which is where a store this package produced lives.
+        full_path = if isabspath(raw)
+            raw
+        elseif dirname(raw) != ""
+            GeoData.project_lakehouse_path(raw, _PROJECT_ROOT)
+        else
+            joinpath(opts.output_dir, raw)
+        end
         return (full_path, basename(raw))
     end
 end
@@ -88,7 +101,6 @@ end
     run_segment_tracking(; opts::HydrodynamicOptions) -> NamedTuple
 
 Simulate Lagrangian particle transport for a snow crab larval cohort across nursery
-spawning areas with DVM swimming, M2 tidal currents, degree-day molting, and
 benthic settlement filtering.
 
 # Inputs
@@ -223,16 +235,17 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
     else
         # Scotian Shelf alongshore current: flows southwestward along the shelf edge.
         # u ≈ -0.08 to -0.12 m/s (westward), v ≈ -0.03 to -0.06 m/s (southward/offshore).
-        # Tidal oscillation superimposed with ~6 h period at quarter-amplitude.
         # Reference: Loder, J. W. & Petrie, B. (1991), CJFAS.
         (lon, lat, z, t) -> begin
-            tidal_phase = 2.0 * π * t / 44712.0  # M2 period ≈ 12.42 h
             depth_decay  = exp(z / 120.0)          # velocity decays with depth
             lon_norm = clamp((lon - opts.domain_lon[1]) /
                              (opts.domain_lon[2] - opts.domain_lon[1]), 0.0, 1.0)
             jet_factor = 0.5 + 0.8 * exp(-((lon_norm - 0.3)^2) / 0.04)
-            u_mean = (-0.10 * jet_factor + 0.02 * sin(tidal_phase)) * depth_decay
-            v_mean = (-0.04 * jet_factor + 0.01 * cos(tidal_phase)) * depth_decay
+            # The mean flow only. There is no tidal term here: tide is carried by the
+            # ocean half's stored flow field, and an analytical fallback has no store to
+            # carry it. A sinusoid added here would be a tide the model never ran.
+            u_mean = -0.10 * jet_factor * depth_decay
+            v_mean = -0.04 * jet_factor * depth_decay
             w_mean = 0.00020 * sin(2.0 * π * lon_norm) * depth_decay
             (u_mean, v_mean, w_mean)
         end
@@ -294,53 +307,6 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         κ_h = opts.diffusivity_h,
         κ_v = opts.diffusivity_v,
         is_lat_lon = true,
-        # Tidal superposition: When reading from a slowly-evolving subsampled store (e.g. 6-hour or daily),
-        # high-frequency tidal velocity is reconstructed analytically: u(x,t) = u_subsampled(x,t) + u_tide(x,t).
-        # This saves 6x to 24x disk storage while preserving tidal excursion fidelity.
-        #
-        # NOTE: GeoOceanModel now carries tide via TPXO9 boundary forcing (placement = :boundary),
-        # so the stored flow field already contains the real tidal cycle. GeoLarvalTracking must NOT
-        # superpose analytic tide on top — that would double-count. `enable_tides` defaults to false.
-        # Set `enable_tides = true` only when reading from a store that predates GeoOceanModel's
-        # tide-on-boundary design.
-        enable_tides = opts.enable_tides,
-        tidal_u_amp = opts.tidal_u_amp,
-        tidal_v_amp = opts.tidal_v_amp,
-        # The constituents and their amplitude ratios come from the TOML via `opts`. Hardcoding
-        # them here would run the tides on a set the operator did not choose, which is the
-        # same class of silent substitution the data path was changed to avoid.
-        tidal_constituents = opts.tidal_constituents,
-        # The M2 amplitude is the config's own; S2's is its own field too, not a fraction of
-        # M2 -- default.toml sets `s2_u_amp = 0.11, s2_v_amp = 0.05`, which are 0.44 of u but
-        # 0.42 of v only by coincidence, and Snowcrab.toml uses the same numbers. The
-        # remaining constituents are given as fractions of M2 because the config declares
-        # nothing else for them, and those fractions are the standard Scotian Shelf ratios.
-        tidal_u_amplitudes = Dict(:M2 => opts.tidal_u_amp,
-                                  :S2 => opts.s2_u_amp,
-                                  :N2 => 0.19 * opts.tidal_u_amp,
-                                  :K1 => 0.18 * opts.tidal_u_amp,
-                                  :O1 => 0.15 * opts.tidal_u_amp),
-        tidal_v_amplitudes = Dict(:M2 => opts.tidal_v_amp,
-                                  :S2 => opts.s2_v_amp,
-                                  :N2 => 0.19 * opts.tidal_v_amp,
-                                  :K1 => 0.18 * opts.tidal_v_amp,
-                                  :O1 => 0.15 * opts.tidal_v_amp),
-        # Phases, in radians. There is no per-constituent phase in the configuration, and
-        # there is none in `opts` either, so the origin is arbitrary and is taken as zero for
-        # M2: a phase is measured from some instant, and without a stated one the tide is
-        # started at its flood. The other constituents are offset from M2 by the standard
-        # fractions, so the superposed cycle is not a single sinusoid repeated.
-        #
-        # This superposition is the fallback, not the tide the ocean run had: when the flow
-        # comes from a store, its `u` already carries the real tidal cycle and this is not
-        # applied at all. It exists for a run whose store predates that, and because
-        # `superpose_tidal_velocity` errors rather than silently dropping a named
-        # constituent, the phases have to be present for every one.
-        tidal_phases = Dict(:M2 => 0.0,
-                            :S2 => 0.0,
-                            :N2 => 0.5,
-                            :K1 => 0.25,
-                            :O1 => 0.75),
         enable_molting = opts.enable_molting,
         # Stochasticity controls. These must be passed explicitly: `track_larval_cohort` defaults
         # all three coefficients of variation to 0.0, i.e. a fully deterministic cohort. Loading
@@ -351,6 +317,29 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         cv_mortality = opts.cv_mortality,
         cv_settlement = opts.cv_settlement,
         settlement_stochastic = opts.settlement_stochastic,
+        # The biology's parameters, forwarded from the configuration. The behaviour module
+        # has its own defaults for all of these; forwarding them is what makes the
+        # configuration file the record of the model that actually ran.
+        t_base = opts.t_base,
+        dd_zoea1_to_zoea2 = opts.dd_zoea1_to_zoea2,
+        dd_zoea2_to_megalopa = opts.dd_zoea2_to_megalopa,
+        dd_megalopa_to_settle = opts.dd_megalopa_to_settle,
+        mortality_base = opts.mortality_base,
+        mortality_thermal_threshold = opts.mortality_thermal_threshold,
+        mortality_thermal_sensitivity = opts.mortality_thermal_sensitivity,
+        mortality_cold_threshold = opts.mortality_cold_threshold,
+        mortality_cold_sensitivity = opts.mortality_cold_sensitivity,
+        settlement_min_depth = opts.settlement_min_depth,
+        settlement_max_depth = opts.settlement_max_depth,
+        settlement_max_temp = opts.settlement_max_temp,
+        zoea1_day_depth = opts.zoea1_day_depth,
+        zoea1_night_depth = opts.zoea1_night_depth,
+        zoea2_day_depth = opts.zoea2_day_depth,
+        zoea2_night_depth = opts.zoea2_night_depth,
+        megalopa_day_depth = opts.megalopa_day_depth,
+        megalopa_night_depth = opts.megalopa_night_depth,
+        zoea2_depth_factor = opts.zoea2_depth_factor,
+        megalopa_swim_factor = opts.megalopa_swim_factor,
         enable_bbl = true,
         enable_sinking = true,
         enable_initial_ascent = opts.enable_initial_ascent,
@@ -502,52 +491,7 @@ function run_segment_metrics(;
         println("  $(rpad(conn.strata_names[i], 28)) -> [$(row_str)]")
     end
 
-    # 5. Depth-stratified Voronoi Tessellation & Multi-Resolution Connectivity
-    voronoi_res = if opts.enable_voronoi
-        println("\nComputing depth-stratified Voronoi tessellation ($(opts.voronoi_n_units) units)...")
-        v_tess = generate_depth_stratified_voronoi_units(
-            :numerical_earth;
-            lon_range = opts.domain_lon,
-            lat_range = opts.domain_lat,
-            n_units = opts.voronoi_n_units,
-            prob_core = opts.voronoi_prob_core,
-            prob_shallow = opts.voronoi_prob_shallow,
-            prob_deep = opts.voronoi_prob_deep,
-            min_res_core_km = opts.voronoi_min_res_core_km,
-            min_res_shallow_km = opts.voronoi_min_res_shallow_km,
-            min_res_deep_km = opts.voronoi_min_res_deep_km,
-            # The TOML states band edges as positive depths below the surface; the tessellator
-            # bins on signed z, so the deeper edge gets the sign.
-            core_depth_range = (-opts.voronoi_core_depth_max, -opts.voronoi_core_depth_min),
-            shallow_depth_range = (-opts.voronoi_shallow_depth_max, -opts.voronoi_shallow_depth_min),
-            deep_depth_range = (-opts.voronoi_deep_depth_max, -opts.voronoi_deep_depth_min),
-            slope_weighting = opts.voronoi_slope_weighting,
-            slope_factor = opts.voronoi_slope_factor,
-            seed = opts.seed
-        )
-        println("Generated $(length(v_tess.units)) Voronoi units across depth strata.")
-
-        # Export Voronoi polygons to standard GeoJSON format for GIS integration
-        geojson_export_path = joinpath(opts.output_dir, "voronoi_units.geojson")
-        try
-            export_voronoi_geojson(v_tess, geojson_export_path)
-            println("Exported Voronoi polygons to GeoJSON -> $(geojson_export_path)")
-        catch geo_err
-            @warn "Failed exporting Voronoi GeoJSON: $(geo_err)"
-        end
-
-        v_metrics = compute_tesselated_connectivity_matrix(target_trajs, v_tess)
-        println("Voronoi Macro-Strata Transition Matrix (3x3):")
-        for (idx, st) in enumerate(v_metrics.strata_names)
-            row_str = join([string(round(v_metrics.macro_matrix[idx, j], digits = 3)) for j in 1:length(v_metrics.strata_names)], ", ")
-            println("  $(rpad(string(st), 12)) -> [$(row_str)]")
-        end
-        (tessellation = v_tess, metrics = v_metrics)
-    else
-        nothing
-    end
-
-    # 6. Export comprehensive multi-variable NetCDF and JLD2 archives
+    # 5. Export comprehensive multi-variable NetCDF and JLD2 archives
     nc_export_path = joinpath(opts.output_dir, "larval_dispersal_analysis.nc")
     jld_export_path = joinpath(opts.output_dir, "larval_dispersal_analysis.jld2")
     active_config = options_to_configuration(opts)
@@ -610,40 +554,6 @@ function run_segment_metrics(;
                     notes = "Hydrodynamic workflow run ($(opts.scenario), $(opts.projection_year))" *
                             (!isempty(opts.run_id) ? " [$(opts.run_id)]" : "")
                 )
-                if opts.enable_voronoi && !isnothing(voronoi_res)
-                    try
-                        if !haskey(db["metrics"], target_run_id)
-                            Zarr.zgroup(db["metrics"], target_run_id)
-                        end
-                        mgroup = db["metrics"][target_run_id]
-                        unit_ids = [u.id for u in voronoi_res.tessellation.units]
-                        lons = [u.lon for u in voronoi_res.tessellation.units]
-                        lats = [u.lat for u in voronoi_res.tessellation.units]
-                        depths = [u.depth for u in voronoi_res.tessellation.units]
-                        strata = [string(u.stratum) for u in voronoi_res.tessellation.units]
-                        areas = [u.area_km2 for u in voronoi_res.tessellation.units]
-                        counts = [u.settlement_count for u in voronoi_res.tessellation.units]
-                        for (aname, adata) in (
-                            "unit_id" => unit_ids,
-                            "lon" => lons,
-                            "lat" => lats,
-                            "depth" => depths,
-                            "stratum" => strata,
-                            "area_km2" => areas,
-                            "settlement_count" => counts
-                        )
-                            if haskey(mgroup, aname)
-                                mgroup[aname][:] = adata
-                            else
-                                arr = Zarr.zcreate(eltype(adata), mgroup, aname, length(adata); chunks=(length(adata),))
-                                arr[:] = adata
-                            end
-                        end
-                        println("Archived $(length(voronoi_res.units)) Voronoi units to Zarr.")
-                    catch v_err
-                        @warn "Failed to archive Voronoi units to Zarr: $(v_err)"
-                    end
-                end
                 println("Zarr run '$(target_run_id)' successfully archived.")
             finally
                 close_storage(db)
@@ -658,7 +568,6 @@ function run_segment_metrics(;
         recruitment_metrics = rec_metrics,
         thermal_metrics = therm_metrics,
         connectivity = conn,
-        voronoi = voronoi_res,
         netcdf_path = nc_export_path,
         jld2_path = jld_export_path,
         storage_path = opts.enable_zarr ? opts.zarr_path : nothing
@@ -1199,6 +1108,27 @@ function run_segment_visualize(;
             cv_mortality = opts.cv_mortality,
             cv_settlement = opts.cv_settlement,
             settlement_stochastic = opts.settlement_stochastic,
+            # The same biology as the primary cohort, parameter for parameter.
+            t_base = opts.t_base,
+            dd_zoea1_to_zoea2 = opts.dd_zoea1_to_zoea2,
+            dd_zoea2_to_megalopa = opts.dd_zoea2_to_megalopa,
+            dd_megalopa_to_settle = opts.dd_megalopa_to_settle,
+            mortality_base = opts.mortality_base,
+            mortality_thermal_threshold = opts.mortality_thermal_threshold,
+            mortality_thermal_sensitivity = opts.mortality_thermal_sensitivity,
+            mortality_cold_threshold = opts.mortality_cold_threshold,
+            mortality_cold_sensitivity = opts.mortality_cold_sensitivity,
+            settlement_min_depth = opts.settlement_min_depth,
+            settlement_max_depth = opts.settlement_max_depth,
+            settlement_max_temp = opts.settlement_max_temp,
+            zoea1_day_depth = opts.zoea1_day_depth,
+            zoea1_night_depth = opts.zoea1_night_depth,
+            zoea2_day_depth = opts.zoea2_day_depth,
+            zoea2_night_depth = opts.zoea2_night_depth,
+            megalopa_day_depth = opts.megalopa_day_depth,
+            megalopa_night_depth = opts.megalopa_night_depth,
+            zoea2_depth_factor = opts.zoea2_depth_factor,
+            megalopa_swim_factor = opts.megalopa_swim_factor,
             rng = rng_comp
         )
         scenario_comp[:ssp585_2050] = trajs_ssp585
@@ -1223,56 +1153,6 @@ function run_segment_visualize(;
         )
     end
 
-    # 11. Depth-Stratified Voronoi Units Spatial Distribution
-    fig_voronoi_path = nothing
-    if opts.enable_voronoi
-        fig_voronoi_path = joinpath(opts.output_dir, "voronoi_units_distribution.png")
-        println("Rendering Voronoi units spatial distribution -> $(fig_voronoi_path)...")
-        try
-            # The run's own bathymetry, resolved the same way the grid was. The Voronoi units
-            # are a partition of the same marine domain, so drawing them from a second product
-            # would make the figure describe a different sea floor from the model it annotates.
-            v_tess = generate_depth_stratified_voronoi_units(
-                ;
-                lon_range = opts.domain_lon,
-                lat_range = opts.domain_lat,
-                # A product name, not a field: the tessellator resolves it through
-                # `GeoDataSources`, and the choice between measured soundings and the global
-                # model is made by coverage, exactly as the ocean half's own segment does it.
-                bathymetry_source = GeoDataSources.preferred_bathymetry_source(;
-                    lon_range = opts.domain_lon, lat_range = opts.domain_lat),
-                n_units = opts.voronoi_n_units,
-                prob_core = opts.voronoi_prob_core,
-                prob_shallow = opts.voronoi_prob_shallow,
-                prob_deep = opts.voronoi_prob_deep,
-                min_res_core_km = opts.voronoi_min_res_core_km,
-                min_res_shallow_km = opts.voronoi_min_res_shallow_km,
-                min_res_deep_km = opts.voronoi_min_res_deep_km,
-                # TOML band edges are positive depths; the tessellator bins on signed z.
-                core_depth_range = (-opts.voronoi_core_depth_max, -opts.voronoi_core_depth_min),
-                shallow_depth_range = (-opts.voronoi_shallow_depth_max, -opts.voronoi_shallow_depth_min),
-                deep_depth_range = (-opts.voronoi_deep_depth_max, -opts.voronoi_deep_depth_min),
-                slope_weighting = opts.voronoi_slope_weighting,
-                slope_factor = opts.voronoi_slope_factor,
-                seed = opts.seed
-            )
-            fig_v = CairoMakie.Figure(size = (1000, 750), fontsize = 13)
-            ax_v = CairoMakie.Axis(
-                fig_v[1, 1],
-                title = "Depth-Stratified Voronoi Units (N=$(length(v_tess.units)))",
-                xlabel = "Longitude (°E)",
-                ylabel = "Latitude (°N)"
-            )
-            lons = [u.lon for u in v_tess.units]
-            lats = [u.lat for u in v_tess.units]
-            strata_codes = [u.stratum == :core ? 1 : (u.stratum == :shallow ? 2 : 3) for u in v_tess.units]
-            CairoMakie.scatter!(ax_v, lons, lats, color = strata_codes, colormap = :viridis, markersize = 6)
-            CairoMakie.save(fig_voronoi_path, fig_v)
-        catch v_err
-            @warn "Failed to render Voronoi unit distribution figure: $(v_err)"
-        end
-    end
-
     println("All visualization figures and interactive maps successfully generated.")
     return (
         fig_trajectories = fig1_path,
@@ -1294,7 +1174,6 @@ function run_segment_visualize(;
         fig_bottom_temperature = fig_tbot_path,
         fig_ts_diagram = fig_ts_diagram_path,
         fig_comparison = fig10_path,
-        fig_voronoi = fig_voronoi_path,
         interactive_map = opts.interactive_map ? html_path : nothing,
         animation = anim_file_path
     )

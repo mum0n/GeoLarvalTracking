@@ -8,8 +8,8 @@ for it; before this file the partition existed only implicitly, built by hand in
 reader and the writer and nowhere else, so nothing could say what a section *meant* or that a
 new one had been misfiled.
 
-Three domains, not two. `[domain]`, `[grid]`, `[metadata]`, `[storage]`, `[hardware]`,
-`[visualization]` and `[paths]` are read by both the ocean and the biology halves of a run, so
+Three domains, not two. `[domain]`, `[grid]`, `[metadata]`, `[storage]`, `[visualization]`
+and `[runtype]` are read by both the ocean and the biology halves of a run, so
 they are not the ocean's to own. They are `:shared`, and they live in the ocean file when the
 config is split — the biology of a study is the biology of *this* ocean, and the ocean
 declares where it is.
@@ -39,10 +39,8 @@ const CONFIG_SECTION_DOMAIN = Dict{String, Symbol}(
     "domain"                => SHARED,
     "grid"                  => SHARED,
     "storage"               => SHARED,
-    "directories"           => SHARED,
-    "hardware"              => SHARED,
     "visualization"         => SHARED,
-    "paths"                 => SHARED,
+    "runtype"               => SHARED,
     # Ocean: what the physical model is forced and bounded by.
     "data"                  => OCEAN,
     "climate"               => OCEAN,
@@ -56,7 +54,6 @@ const CONFIG_SECTION_DOMAIN = Dict{String, Symbol}(
     "biology"               => BIOLOGY,
     "dvm"                   => BIOLOGY,
     "molting_and_settlement" => BIOLOGY,
-    "tessellation"          => BIOLOGY,
 )
 
 """

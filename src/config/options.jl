@@ -14,7 +14,6 @@ finds all of them here.
     HydrodynamicOptions
 
 Runtime parameter specification for regional hydrodynamic circulation,
-tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 (Chionoecetes opilio) larval transport modeling.
 
 # Fields
@@ -26,9 +25,6 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
   `[data] bathy_source` (for example `"etopo2022"`, `"synthetic"`). There is no separate
   real/synthetic switch: acquisition always reads the named product, and falls back to analytic
   fields with a warning if a download fails.
-- `enable_tides::Bool`: Whether to include astronomical tidal body forcing (M2).
-- `tidal_u_amp::Float64`: Zonal tidal velocity amplitude in m/s.
-- `tidal_v_amp::Float64`: Meridional tidal velocity amplitude in m/s.
 - `scenario::Symbol`: Climate scenario (:historical, :ssp126, :ssp245, :ssp585, :mhw).
 - `projection_year::Int`: Target climate scenario year (e.g. 2050).
 - `sim_dt::Float64`: Initial hydrodynamic integration time step in seconds.
@@ -54,10 +50,9 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
   Defaults to `false`, so the run fails loudly instead of quietly running somewhere other than
   where `use_gpu` said it would.
 - `interactive_map::Bool`: Whether to export interactive HTML5 Leaflet map.
-- `output_path::AbstractString`: Base path for simulation outputs. Extension determines format:
-  - `.zarr` or directory: Zarr storage via GeoData
-  - `.jld2`: Direct JLD2 file for hydrodynamic outputs
-  - No extension: treated as directory for JLD2 files (legacy behavior)
+- `output_dir::String`: The absolute directory this run writes into. Everything the run
+  produces lives beneath it: the trajectory store, the restart archives, the ingested-data
+  cache, the resolved configuration and the provenance record.
 - `storage_backend::String`: Storage backend for larval data ("zarr" or "geoparquet").
 - `config_file::String`: Source configuration file path.
 - `bathy_source::String`: Which bathymetry product to ingest; the run always reads the product
@@ -84,22 +79,6 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `ocean_boundary_source::Symbol`: Open boundary hydrographic data provider (:glorys12v1, :synthetic).
   See the field comments for the full accepted set.
 - `obc_type::Symbol`: Lateral open boundary formulation (:flather_chapman, :radiation, :clamped).
-- `enable_voronoi::Bool`: Whether to compute multi-resolution Voronoi tessellation analysis.
-- `voronoi_n_units::Int`: Number of Voronoi units/centroids to generate across strata.
-- `voronoi_prob_core::Float64`: Sampling probability weight for core depth stratum (50 to 350 m).
-- `voronoi_prob_shallow::Float64`: Sampling probability weight for shallow stratum (0 to 50 m).
-- `voronoi_prob_deep::Float64`: Sampling probability weight for deep stratum (> 350 m).
-- `voronoi_min_res_core_km::Float64`: Minimum Poisson-disc separation distance in core zone (km).
-- `voronoi_min_res_shallow_km::Float64`: Minimum separation distance in shallow zone (km).
-- `voronoi_min_res_deep_km::Float64`: Minimum separation distance in deep zone (km).
-- `voronoi_core_depth_min`/`_max`, `voronoi_shallow_depth_min`/`_max`,
-  `voronoi_deep_depth_min`/`_max`::Float64: The edges of the three depth strata, as positive
-  depths below the surface. These decide which seabed area each stratum samples, so they change
-  the connectivity result, not just its resolution. The sign is applied when the bands reach the
-  tessellator, which bins on signed `z`.
-- `voronoi_slope_weighting::Bool`: Whether minimum spacing is tightened on steep bathymetry.
-- `voronoi_slope_factor::Float64`: How aggressively spacing tightens with slope; only used when
-  `voronoi_slope_weighting` is true.
 """
 struct HydrodynamicOptions
     domain_lon               :: Tuple{Float64, Float64}
@@ -112,13 +91,6 @@ struct HydrodynamicOptions
     wind_time_iso            :: String
     inshore_depth            :: Float64
     shelf_slope              :: Float64
-    enable_tides             :: Bool
-    tides_source             :: String
-    tidal_constituents       :: Vector{Symbol}
-    tidal_u_amp              :: Float64
-    tidal_v_amp              :: Float64
-    s2_u_amp                 :: Float64
-    s2_v_amp                 :: Float64
     scenario                 :: Symbol
     projection_year          :: Int
     sim_dt                   :: Float64
@@ -138,6 +110,26 @@ struct HydrodynamicOptions
     diffusivity_v            :: Float64
     enable_dvm               :: Bool
     enable_molting           :: Bool
+    zoea1_day_depth          :: Float64
+    zoea1_night_depth        :: Float64
+    zoea2_day_depth          :: Float64
+    zoea2_night_depth        :: Float64
+    megalopa_day_depth       :: Float64
+    megalopa_night_depth     :: Float64
+    zoea2_depth_factor       :: Float64
+    megalopa_swim_factor     :: Float64
+    t_base                   :: Float64
+    dd_zoea1_to_zoea2        :: Float64
+    dd_zoea2_to_megalopa     :: Float64
+    dd_megalopa_to_settle    :: Float64
+    mortality_base           :: Float64
+    mortality_thermal_threshold :: Float64
+    mortality_thermal_sensitivity :: Float64
+    mortality_cold_threshold :: Float64
+    mortality_cold_sensitivity :: Float64
+    settlement_min_depth     :: Float64
+    settlement_max_depth     :: Float64
+    settlement_max_temp      :: Float64
     min_seabed_depth         :: Float64
     buffer_km                :: Float64
     release_depth_mode       :: Symbol
@@ -158,7 +150,6 @@ struct HydrodynamicOptions
      checkpoint_prefix        :: String
      checkpoint_schedule      :: Float64
      output_schedule_seconds  :: Float64
-     output_path              :: AbstractString
      storage_backend          :: String
      enable_zarr              :: Bool
      zarr_path                :: String
@@ -227,14 +218,7 @@ struct HydrodynamicOptions
     #                         debug; the sea will warm monotonically and never vary.
     #     "synthetic"         A single fixed number. No download, no variation. Diagnostics only.
     #
-    #   tides_source  -- what sets the rise and fall of the tides
-    #     "tpxo9_atlas"   Measured tide heights and currents, free and no account. Supplies the
-    #                     real size of the M2 and S2 tides, which is what makes the spring-neap
-    #                     cycle (big tides every two weeks) come out right.
     #     "tpxo9"         The same product, named more briefly.
-    #     "analytic"      Tide shapes made up from a single number you supply. No download, and
-    #                     no detail across space, so tides are the same everywhere in the
-    #                     domain. Fine for checking the machinery, not for a real tide.
     #
     #   bathy_source  -- where the sea floor shape comes from
     #     "etopo2022"  A global map of the sea floor, free and no account, detailed to about
@@ -262,22 +246,6 @@ struct HydrodynamicOptions
     hydrography_source       :: Symbol
     hydrography_month        :: Int      # WOA23 month selector (0 = annual climatology)
     obc_type                 :: Symbol
-    enable_voronoi           :: Bool
-    voronoi_n_units          :: Int
-    voronoi_prob_core        :: Float64
-    voronoi_prob_shallow     :: Float64
-    voronoi_prob_deep        :: Float64
-    voronoi_min_res_core_km  :: Float64
-    voronoi_min_res_shallow_km :: Float64
-    voronoi_min_res_deep_km  :: Float64
-    voronoi_core_depth_min   :: Float64
-    voronoi_core_depth_max   :: Float64
-    voronoi_shallow_depth_min :: Float64
-    voronoi_shallow_depth_max :: Float64
-    voronoi_deep_depth_min   :: Float64
-    voronoi_deep_depth_max   :: Float64
-    voronoi_slope_weighting  :: Bool
-    voronoi_slope_factor     :: Float64
     animate_hydro            :: Bool
     anim_variable            :: Symbol
     anim_fps                 :: Int
@@ -289,7 +257,6 @@ struct HydrodynamicOptions
     boundary_method          :: Symbol   # :relaxation | :none
     sponge_layer_width       :: Float64  # sponge buffer width (degrees)
     sponge_timescale         :: Float64  # relaxation timescale (s)
-    tidal_relaxation_timescale :: Float64  # relaxation toward the prescribed tide (s)
     u_inflow                 :: Float64  # reference zonal inflow velocity (m/s)
     v_inflow                 :: Float64  # reference meridional inflow velocity (m/s)
     # Time integration ceiling
@@ -313,13 +280,6 @@ function HydrodynamicOptions(;
     wind_time_iso          :: AbstractString = "2020-06-01T00:00:00Z",
     inshore_depth          :: Real = -20.0,
     shelf_slope            :: Real = 500.0,
-    enable_tides          :: Bool = true,
-    tides_source          :: AbstractString = "tpxo9",
-    tidal_constituents    :: AbstractVector{Symbol} = [:M2, :S2],
-    tidal_u_amp           :: Real = 0.25,
-    tidal_v_amp           :: Real = 0.12,
-    s2_u_amp              :: Real = 0.11,
-    s2_v_amp              :: Real = 0.05,
     scenario              :: Symbol = :ssp245,
     projection_year       :: Int = 2050,
     sim_dt                :: Real = 120.0,
@@ -339,6 +299,26 @@ function HydrodynamicOptions(;
     diffusivity_v         :: Real = 1e-4,
     enable_dvm            :: Bool = true,
     enable_molting        :: Bool = true,
+    zoea1_day_depth       :: Real = -50.0,
+    zoea1_night_depth     :: Real = -10.0,
+    zoea2_day_depth       :: Real = -55.0,
+    zoea2_night_depth     :: Real = -8.0,
+    megalopa_day_depth    :: Real = -120.0,
+    megalopa_night_depth  :: Real = -60.0,
+    zoea2_depth_factor    :: Real = 1.2,
+    megalopa_swim_factor  :: Real = 1.5,
+    t_base                :: Real = -1.5,
+    dd_zoea1_to_zoea2     :: Real = 65.0,
+    dd_zoea2_to_megalopa  :: Real = 130.0,
+    dd_megalopa_to_settle :: Real = 200.0,
+    mortality_base        :: Real = 0.02,
+    mortality_thermal_threshold :: Real = 7.0,
+    mortality_thermal_sensitivity :: Real = 0.015,
+    mortality_cold_threshold :: Real = -1.5,
+    mortality_cold_sensitivity :: Real = 0.01,
+    settlement_min_depth  :: Real = -250.0,
+    settlement_max_depth  :: Real = -50.0,
+    settlement_max_temp   :: Real = 6.0,
     min_seabed_depth      :: Real = 100.0,
     buffer_km             :: Real = 100.0,
     release_depth_mode    :: Symbol = :bottom,
@@ -382,22 +362,6 @@ function HydrodynamicOptions(;
     hydrography_source       :: Symbol = :synthetic,
     hydrography_month        :: Int     = 0,
     obc_type                 :: Symbol = :flather_chapman,
-    enable_voronoi           :: Bool = false,
-    voronoi_n_units          :: Int = 5000,
-    voronoi_prob_core        :: Real = 0.8,
-    voronoi_prob_shallow     :: Real = 0.1,
-    voronoi_prob_deep        :: Real = 0.1,
-    voronoi_min_res_core_km  :: Real = 1.5,
-    voronoi_min_res_shallow_km :: Real = 5.0,
-    voronoi_min_res_deep_km  :: Real = 10.0,
-    voronoi_core_depth_min   :: Real = 50.0,
-    voronoi_core_depth_max   :: Real = 350.0,
-    voronoi_shallow_depth_min :: Real = 0.0,
-    voronoi_shallow_depth_max :: Real = 50.0,
-    voronoi_deep_depth_min   :: Real = 350.0,
-    voronoi_deep_depth_max   :: Real = 6000.0,
-    voronoi_slope_weighting  :: Bool = true,
-    voronoi_slope_factor     :: Real = 15.0,
     animate_hydro            :: Bool = false,
     anim_variable            :: Symbol = :dashboard,
     anim_fps                 :: Int = 10,
@@ -408,7 +372,6 @@ function HydrodynamicOptions(;
     boundary_method          :: Symbol = :relaxation,
     sponge_layer_width       :: Real = 0.35,
     sponge_timescale         :: Real = 3600.0,
-    tidal_relaxation_timescale :: Real = 3600.0,
     u_inflow                 :: Real = -0.15,
     v_inflow                 :: Real = 0.05,
     max_dt                   :: Real = 600.0,
@@ -442,13 +405,6 @@ function HydrodynamicOptions(;
         wind_time_iso,
         Float64(inshore_depth),
         Float64(shelf_slope),
-        enable_tides,
-        tides_source,
-        tidal_constituents,
-        Float64(tidal_u_amp),
-        Float64(tidal_v_amp),
-        Float64(s2_u_amp),
-        Float64(s2_v_amp),
         scenario,
         projection_year,
         Float64(sim_dt),
@@ -468,6 +424,26 @@ function HydrodynamicOptions(;
         Float64(diffusivity_v),
         enable_dvm,
         enable_molting,
+        Float64(zoea1_day_depth),
+        Float64(zoea1_night_depth),
+        Float64(zoea2_day_depth),
+        Float64(zoea2_night_depth),
+        Float64(megalopa_day_depth),
+        Float64(megalopa_night_depth),
+        Float64(zoea2_depth_factor),
+        Float64(megalopa_swim_factor),
+        Float64(t_base),
+        Float64(dd_zoea1_to_zoea2),
+        Float64(dd_zoea2_to_megalopa),
+        Float64(dd_megalopa_to_settle),
+        Float64(mortality_base),
+        Float64(mortality_thermal_threshold),
+        Float64(mortality_thermal_sensitivity),
+        Float64(mortality_cold_threshold),
+        Float64(mortality_cold_sensitivity),
+        Float64(settlement_min_depth),
+        Float64(settlement_max_depth),
+        Float64(settlement_max_temp),
         Float64(min_seabed_depth),
         Float64(buffer_km),
         release_depth_mode,
@@ -488,7 +464,6 @@ function HydrodynamicOptions(;
         resolved_cp_prefix,
         Float64(checkpoint_schedule),
         Float64(output_schedule_seconds),
-        String(output_path),
         String(storage_backend),
         enable_zarr,
         String(zarr_path),
@@ -511,22 +486,6 @@ function HydrodynamicOptions(;
         hydrography_source,
         hydrography_month,
         obc_type,
-        enable_voronoi,
-        voronoi_n_units,
-        Float64(voronoi_prob_core),
-        Float64(voronoi_prob_shallow),
-        Float64(voronoi_prob_deep),
-        Float64(voronoi_min_res_core_km),
-        Float64(voronoi_min_res_shallow_km),
-        Float64(voronoi_min_res_deep_km),
-        Float64(voronoi_core_depth_min),
-        Float64(voronoi_core_depth_max),
-        Float64(voronoi_shallow_depth_min),
-        Float64(voronoi_shallow_depth_max),
-        Float64(voronoi_deep_depth_min),
-        Float64(voronoi_deep_depth_max),
-        voronoi_slope_weighting,
-        Float64(voronoi_slope_factor),
         animate_hydro,
         anim_variable,
         anim_fps,
@@ -537,7 +496,6 @@ function HydrodynamicOptions(;
         boundary_method,
         Float64(sponge_layer_width),
         Float64(sponge_timescale),
-        Float64(tidal_relaxation_timescale),
         Float64(u_inflow),
         Float64(v_inflow),
         Float64(max_dt),
@@ -582,12 +540,6 @@ struct HydrodynamicConfig
     obc_type                 :: Symbol
     sponge_layer_width       :: Float64
     sponge_timescale         :: Float64
-    tidal_relaxation_timescale :: Float64
-    enable_tides             :: Bool
-    tides_source             :: Symbol
-    tidal_constituents       :: Vector{Symbol}
-    tidal_u_amp              :: Float64
-    tidal_v_amp              :: Float64
     cd_drag                  :: Float64
     bottom_drag              :: Float64
     bbl_mixing_closure       :: Symbol
@@ -633,6 +585,10 @@ struct LarvalDispersalConfig
     ascent_speed             :: Float64
     ascent_target_depth      :: Float64
     enable_dvm               :: Bool
+    zoea1_day_depth          :: Float64
+    zoea1_night_depth        :: Float64
+    zoea2_day_depth          :: Float64
+    zoea2_night_depth        :: Float64
     megalopa_day_depth       :: Float64
     megalopa_night_depth     :: Float64
     zoea2_depth_factor       :: Float64

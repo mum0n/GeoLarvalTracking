@@ -166,7 +166,10 @@ function main(args::Vector{String})
 
     cfg_file = resolve_config_file(flags["config"])
     opts = try
-        configuration_to_options(load_configuration(cfg_file))
+        # The configuration's own name is passed on: it is what names this run's directory
+        # in the lakehouse when the configuration does not name one itself.
+        configuration_to_options(load_configuration(cfg_file);
+                                 config_name = resolve_config_name(cfg_file))
     catch err
         println("Configuration error: $(sprint(showerror, err))")
         return display_help()

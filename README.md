@@ -39,17 +39,22 @@ stored results.
 ## Configurations
 
 Two, in `configs/` (the biology schema sections — `biology`, `dvm`,
-`molting_and_settlement`, `tessellation` — are the larval model's own):
+`molting_and_settlement` — are the larval model's own):
 
 | config | purpose |
 |---|---|
 | `default.toml` | Cape Breton demonstration — small cohort, generic placeholder biology, tracked through the keyless ocean `default.toml` store. |
 | `snowcrab.toml` | Snow Crab production — 500-particle cohort over the 60-day pelagic larval duration, with snow-crab biology/DVM/degree-day parameters. |
 
-- **`[directories]`** encodes the two lakehouse directories that wire this package to its data:
-  `ocean_model` (the ocean store to track through — the `--hydro-file` default) and
-  `output_path` (this package's results store). Both default into
-  `lakehouse_dir("Geo{Larval,Ocean}Model", …)`; a command-line `--hydro-file` overrides.
+- **`[storage]`** is where the run reads and writes: `output_dir` (this package's results
+  directory) and `ocean_model` (the realized ocean store to track through — the
+  `--hydro-file` default). Both default into `lakehouse_dir("Geo{Larval,Ocean}Model", …)`;
+  a command-line `--hydro-file` overrides. `ocean_model` names the GeoData store itself —
+  the `hydrodynamics.zarr` directory the ocean half wrote — not the run directory holding
+  it.
+- A configuration that names no output directory of its own still writes into the
+  lakehouse, under its own name. A run never lands in the package root: that is outside
+  the lakehouse, where the other half never looks and no later run finds it.
 - No `--config` ⇒ `configs/default.toml`.
 
 ### Shared Lakehouse Configuration
@@ -70,7 +75,7 @@ GeoData.set_lakehouse_dir!("/path/to/shared/lakehouse")
 ## Results
 
 Trajectories, metrics and figures are written to this package's results store
-(`[directories] output_path`, a Zarr store via the analysis layer) — separate from the input
+(`[storage] output_dir`, a Zarr store via the analysis layer) — separate from the input
 ocean store, which is read only.
 
 ## Notes / known gaps

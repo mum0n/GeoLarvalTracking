@@ -222,7 +222,6 @@ function save_simulation_run!(
     n_parts = Int(hasproperty(opts, :n_particles) ? opts.n_particles : size(canonical_trajs.lons, 1))
     duration = Float64(hasproperty(opts, :track_duration) ? opts.track_duration : (canonical_trajs.times[end] - canonical_trajs.times[1]))
     dt_val = Float64(hasproperty(opts, :track_dt) ? opts.track_dt : (length(canonical_trajs.times) > 1 ? canonical_trajs.times[2] - canonical_trajs.times[1] : 300.0))
-    tides = Bool(hasproperty(opts, :enable_tides) ? opts.enable_tides : false)
     dvm = Bool(hasproperty(opts, :enable_dvm) ? opts.enable_dvm : true)
     molt = Bool(hasproperty(opts, :enable_molting) ? opts.enable_molting : true)
     diff_h = Float64(hasproperty(opts, :diffusivity_h) ? opts.diffusivity_h : 10.0)
@@ -270,7 +269,6 @@ function save_simulation_run!(
             "n_particles" => n_parts,
             "duration_seconds" => duration,
             "dt_seconds" => dt_val,
-            "enable_tides" => tides,
             "enable_dvm" => dvm,
             "enable_molting" => molt,
             "diffusivity_h" => diff_h,

@@ -8,21 +8,36 @@ structs, and back. `get_val` lives here because it is how a dict may be missing
 keys during conversion.
 """
 
+"""
+    _PROJECT_ROOT
+
+The root of this package -- the directory holding `src/`, `configs/` and `Project.toml`.
+
+Configured output paths are resolved against it, so a run started from any working
+directory writes to the same place.
+"""
+const _PROJECT_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+
 
 """
-    configuration_to_options(config_dict::AbstractDict; overrides...) -> HydrodynamicOptions
+    configuration_to_options(config_dict::AbstractDict; config_name = "", overrides...) -> HydrodynamicOptions
 
 Convert a configuration dictionary into a validated `HydrodynamicOptions` instance,
 allowing optional keyword parameter overrides.
 
 # Inputs
 - `config_dict::AbstractDict`: Parsed configuration dictionary.
+- `config_name::AbstractString`: The configuration's own name, used to name its directory
+  in the lakehouse when the configuration names no output directory of its own. Empty
+  means "the caller did not say", and the name `default` is used.
 - `overrides...`: Additional keyword arguments to override dictionary entries.
 
 # Outputs
 - `HydrodynamicOptions`: Constructed runtime options instance.
 """
-function configuration_to_options(config_dict::AbstractDict; overrides...)
+function configuration_to_options(config_dict::AbstractDict;
+                                  config_name::AbstractString = "",
+                                  overrides...)
     # Helper to safely extract nested values with defaults
     function get_val(section::String, key::String, default_val)
         if haskey(config_dict, section) && haskey(config_dict[section], key)
@@ -56,26 +71,10 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     shelf_slope   = Float64(get_val("bathymetry", "shelf_slope", 500.0))
     mask_bay_of_fundy = Bool(get_val("bathymetry", "mask_bay_of_fundy", false))
 
-    # Tidal body forcing. `constituents` is an empty list in a config that disables tides, so
     # an empty read is not an error; it simply means no constituents were requested.
     #
-    # NOTE: Tide is now carried by GeoOceanModel's stored flow field (TPXO9 boundary forcing,
-    # placement = :boundary). GeoLarvalTracking reads it from the store and does NOT superpose
-    # analytic tide on top — that would double-count. `enable_tides` defaults to false here.
-    tides_src = String(get_val("tides", "tides_source", "tpxo9"))
-    raw_cons = get_val("tides", "constituents", Any[:M2, :S2])
-    # Normalised to upper case because `get_tidal_frequency` dispatches on `:M2`/`:S2`
     # case-sensitively, while the atlas file lookup is case-insensitive. Normalising here
-    # means a TOML writing "m2" and one writing "M2" behave identically.
-    tidal_cons = Symbol[Symbol(uppercase(String(c))) for c in raw_cons]
 
-    enable_tides = Bool(get_val("tides", "enable_tides", false))
-    tides_source = tides_src
-    tidal_constituents = tidal_cons
-    tidal_u = Float64(get_val("tides", "tidal_u_amp", 0.25))
-    tidal_v = Float64(get_val("tides", "tidal_v_amp", 0.12))
-    s2_u = Float64(get_val("tides", "s2_u_amp", 0.11))
-    s2_v = Float64(get_val("tides", "s2_v_amp", 0.05))
 
     scenario = Symbol(get_val("climate", "scenario", "ssp245"))
     proj_year = Int(get_val("climate", "projection_year", 2050))
@@ -141,14 +140,43 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     enable_dvm = Bool(get_val("dvm", "enable_dvm", true))
     enable_molting = Bool(get_val("molting_and_settlement", "enable_molting", true))
 
+    # Diel Vertical Migration: the target depths the larvae hold by day and by night,
+    # per stage, and the two swim-speed multipliers. These decide where the cohort is in
+    # the water column at any hour, so they are read from the configuration rather than
+    # left to the behaviour module's defaults -- a run whose DVM depths live in code
+    # cannot be reproduced from its configuration file.
+    zoea1_day_depth       = Float64(get_val("dvm", "zoea1_day_depth", -50.0))
+    zoea1_night_depth     = Float64(get_val("dvm", "zoea1_night_depth", -10.0))
+    zoea2_day_depth       = Float64(get_val("dvm", "zoea2_day_depth", -55.0))
+    zoea2_night_depth     = Float64(get_val("dvm", "zoea2_night_depth", -8.0))
+    megalopa_day_depth    = Float64(get_val("dvm", "megalopa_day_depth", -120.0))
+    megalopa_night_depth  = Float64(get_val("dvm", "megalopa_night_depth", -60.0))
+    zoea2_depth_factor    = Float64(get_val("dvm", "zoea2_depth_factor", 1.2))
+    megalopa_swim_factor  = Float64(get_val("dvm", "megalopa_swim_factor", 1.5))
+
+    # Phenology: the degree-day thresholds that move a larva between stages, and the
+    # mortality and settlement envelopes. A cohort that molts at 65 °C·d in one run and
+    # 150 °C·d in the next is a different model, and the difference has to be in the
+    # configuration file for anyone to see it.
+    t_base                   = Float64(get_val("molting_and_settlement", "t_base", -1.5))
+    dd_zoea1_to_zoea2        = Float64(get_val("molting_and_settlement", "dd_zoea1_to_zoea2", 65.0))
+    dd_zoea2_to_megalopa     = Float64(get_val("molting_and_settlement", "dd_zoea2_to_megalopa", 130.0))
+    dd_megalopa_to_settle    = Float64(get_val("molting_and_settlement", "dd_megalopa_to_settle", 200.0))
+    mortality_base           = Float64(get_val("molting_and_settlement", "mortality_base", 0.02))
+    mortality_thermal_threshold = Float64(get_val("molting_and_settlement", "mortality_thermal_threshold", 7.0))
+    mortality_thermal_sensitivity = Float64(get_val("molting_and_settlement", "mortality_thermal_sensitivity", 0.015))
+    mortality_cold_threshold = Float64(get_val("molting_and_settlement", "mortality_cold_threshold", -1.5))
+    mortality_cold_sensitivity = Float64(get_val("molting_and_settlement", "mortality_cold_sensitivity", 0.01))
+    settlement_min_depth     = Float64(get_val("molting_and_settlement", "settlement_min_depth", -250.0))
+    settlement_max_depth     = Float64(get_val("molting_and_settlement", "settlement_max_depth", -50.0))
+    settlement_max_temp      = Float64(get_val("molting_and_settlement", "settlement_max_temp", 6.0))
+
     # Stochastic biology parameters
     settlement_stochastic = Bool(get_val("biology", "settlement_stochastic", true))
     cv_molt = Float64(get_val("biology", "cv_molt", 0.25))
     cv_mortality = Float64(get_val("biology", "cv_mortality", 0.25))
     cv_settlement = Float64(get_val("biology", "cv_settlement", 0.25))
 
-    use_gpu      = Bool(get_val("hardware", "use_gpu", false))
-    fallback_cpu = Bool(get_val("hardware", "fallback_to_cpu", false))
     interactive  = Bool(get_val("visualization", "interactive_map", true))
     anim_hydro   = Bool(get_val("visualization", "animate_hydro", false))
     anim_var     = Symbol(lowercase(String(get_val("visualization", "anim_variable", "dashboard"))))
@@ -158,34 +186,66 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
      anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
-     # [directories] is the coupling with the ocean half plus this half's output: `ocean_model`
-     # is the realized GeoData store to track through (the `--hydro-file` default), and
-     # `output_path` is this half's results directory in the lakehouse.
-     dirs_output = String(get_val("directories", "output_path", ""))
-     dirs_ocean  = String(get_val("directories", "ocean_model", ""))
-     output_path = String(get_val("storage", "output_path", isempty(dirs_output) ? joinpath("outputs", "default") : dirs_output))
-     zarr_path   = String(get_val("storage", "zarr_path", joinpath("outputs", "particle_tracking.zarr")))
+     # Where this half writes, and what it reads. Both are storage: the directory the run
+     # writes into, and the realized ocean store it tracks through. One section, one
+     # source of truth -- two sections naming the same run's places is two chances for
+     # them to disagree, and the disagreement is silent: the run writes its results
+     # somewhere the next run does not look.
+     _storage_output = String(get_val("storage", "output_dir", ""))
+     # Where a run writes when the configuration names no directory of its own: the
+     # lakehouse, under this configuration's own name. NOT a package-relative
+     # `outputs/default`, which put the run in the package root -- outside the lakehouse,
+     # where the other half never looks and no later run finds it. `lakehouse_dir` is the
+     # shared resolver, so the environment override, the local preference and the user
+     # configuration apply here as they do everywhere else.
+     _config_stem = isempty(strip(config_name)) ? "default" : strip(String(config_name))
+     _lakehouse_output = GeoData.lakehouse_dir("GeoLarvalTracking", _config_stem)
+     # The path is resolved against THIS PACKAGE'S ROOT, not the current working directory:
+     # a run started from anywhere then lands in the same place. The resolver also accepts
+     # the lakehouse either inside the project (`lakehouse/...`) or beside it
+     # (`../lakehouse/...`), so a config written for one layout still resolves in the other.
+     # When the configuration names no directory at all, the lakehouse default is used --
+     # resolved absolutely, so a run started from any working directory writes to the
+     # same place.
+     output_dir = isempty(_storage_output) ? _lakehouse_output :
+                  GeoData.project_lakehouse_path(_storage_output, _PROJECT_ROOT)
+     # The trajectory store lives under this run's output directory unless the
+     # configuration names a path explicitly. A CWD-relative path put the store
+     # outside the lakehouse whenever the run was started from elsewhere.
+     _zarr_raw = String(get_val("storage", "zarr_path", ""))
      storage_backend = String(get_val("storage", "storage_backend", "zarr"))
+     enable_zarr = Bool(get_val("storage", "enable_zarr", true))
      
      enable_checkpoint = Bool(get_val("storage", "enable_checkpoint", true))
      checkpoint_prefix = String(get_val("storage", "checkpoint_prefix", "checkpoint_ParticleTracking"))
      checkpoint_schedule_seconds = Float64(get_val("storage", "checkpoint_schedule_seconds", 21600.0))
-     checkpoint_dir = String(get_val("storage", "checkpoint_dir", "outputs/checkpoints"))
+     checkpoint_dir = String(get_val("storage", "checkpoint_dir", ""))
      checkpoint_cleanup = Bool(get_val("storage", "checkpoint_cleanup", true))
      
-     # Ingested data lives in `<output_path>` directory's `inputs` subdirectory, beside this
-     # run's outputs, provenance and resolved config. It is deliberately NOT configurable and
-     # NOT shared between runs: a single top-level `inputs/` let a run with a changed domain
-     # silently reuse another domain's bathymetry, which is exactly the quiet mismatch
-     # `resolved_config.toml` and `data_provenance.json` exist to expose. The cost is disk --
-     # a dataset is fetched once per scenario rather than once per machine -- and that is the
-     # intended trade, because it makes each scenario a self-contained, shareable directory.
-     output_dir = isempty(dirs_output) ? dirname(output_path) : dirs_output
+     # Ingested data lives in the run's output directory's `inputs` subdirectory, beside
+     # this run's outputs, provenance and resolved config. It is deliberately NOT
+     # configurable and NOT shared between runs: a single top-level `inputs/` let a run
+     # with a changed domain silently reuse another domain's bathymetry, which is exactly
+     # the quiet mismatch `resolved_config.toml` and `data_provenance.json` exist to
+     # expose. The cost is disk -- a dataset is fetched once per scenario rather than once
+     # per machine -- and that is the intended trade, because it makes each scenario a
+     # self-contained, shareable directory.
      input_dir  = joinpath(output_dir, "inputs")
-     seed       = Int(get_val("paths", "seed", 42))
+     # The trajectory store and the restart archives are part of this run's output
+     # tree. Named explicitly, they are honoured; otherwise they are derived.
+     zarr_path = isempty(strip(_zarr_raw)) ?
+                 joinpath(output_dir, "particle_tracking.zarr") :
+                 GeoData.project_lakehouse_path(_zarr_raw, _PROJECT_ROOT)
+     seed       = Int(get_val("runtype", "seed", 42))
 
-     hydro_file = String(get_val("directories", "ocean_model",
-                                 get_val("hydrodynamics", "hydro_model_file", "")))
+     # The realized ocean store this run tracks through. `[storage] ocean_model` names it;
+     # `[hydrodynamics] hydro_model_file` is accepted as an alias. When neither names one,
+     # the ocean half's own lakehouse directory is the default -- the ocean run of the
+     # same name, not a file inside this run's output directory, which is where an
+     # unqualified fallback used to look and where no ocean store has ever been.
+     hydro_file = String(get_val("storage", "ocean_model",
+                          get_val("hydrodynamics", "hydro_model_file",
+                              GeoData.lakehouse_dir("GeoOceanModel", _config_stem))))
      hydro_only = Bool(get_val("hydrodynamics", "hydro_only", false))
      track_only = Bool(get_val("hydrodynamics", "track_only", false))
     reuse_hydro = Bool(get_val("hydrodynamics", "reuse_hydro", false))
@@ -200,8 +260,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # Field-output cadence, distinct from the checkpoint cadence. Read from [storage] rather
     # than hardcoded downstream, so the two can legitimately differ.
     out_sched = Float64(get_val("storage", "output_schedule_seconds", 21600.0))
-    cp_dir    = String(get_val("storage", "checkpoint_dir",
-                               get_val("paths", "checkpoint_dir", "")))
+    # Restart archives are part of this run's output tree. Named explicitly they
+    # are honoured; otherwise they sit beside the trajectory store.
+    _cp_raw = String(get_val("storage", "checkpoint_dir", ""))
+    cp_dir = isempty(strip(_cp_raw)) ?
+               joinpath(output_dir, "checkpoints") :
+               GeoData.project_lakehouse_path(_cp_raw, _PROJECT_ROOT)
     cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", true))
     auto_res  = Bool(get_val("hydrodynamics", "auto_restart", true))
     overwrite_val = Bool(get_val("hydrodynamics", "overwrite", false))
@@ -279,27 +343,6 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # Maximum allowable time step ceiling
     max_dt_val = Float64(get_val("hydrodynamics", "max_dt_seconds", sim_dt))
 
-    # Voronoi tessellation parameters
-    enable_voronoi = Bool(get_val("tessellation", "enable_voronoi", false))
-    voronoi_n_units = Int(get_val("tessellation", "n_units", 5000))
-    voronoi_p_core = Float64(get_val("tessellation", "prob_core", 0.8))
-    voronoi_p_shallow = Float64(get_val("tessellation", "prob_shallow", 0.1))
-    voronoi_p_deep = Float64(get_val("tessellation", "prob_deep", 0.1))
-    voronoi_min_core = Float64(get_val("tessellation", "min_res_core_km", 1.5))
-    voronoi_min_shallow = Float64(get_val("tessellation", "min_res_shallow_km", 5.0))
-    voronoi_min_deep = Float64(get_val("tessellation", "min_res_deep_km", 10.0))
-    # Depth band edges, as positive depths below the surface (the TOML convention). The
-    # tessellator works in signed z (negative downwards), so the sign is applied when the
-    # bands are passed to it; see the `generate_depth_stratified_voronoi_units` call.
-    voronoi_core_min     = Float64(get_val("tessellation", "core_depth_min", 50.0))
-    voronoi_core_max     = Float64(get_val("tessellation", "core_depth_max", 350.0))
-    voronoi_shallow_min  = Float64(get_val("tessellation", "shallow_depth_min", 0.0))
-    voronoi_shallow_max  = Float64(get_val("tessellation", "shallow_depth_max", 50.0))
-    voronoi_deep_min     = Float64(get_val("tessellation", "deep_depth_min", 350.0))
-    voronoi_deep_max     = Float64(get_val("tessellation", "deep_depth_max", 6000.0))
-    voronoi_slope_wt     = Bool(get_val("tessellation", "slope_weighting", true))
-    voronoi_slope_fac    = Float64(get_val("tessellation", "slope_factor", 15.0))
-
     # Construct HydrodynamicOptions with overrides applied
     return HydrodynamicOptions(;
         domain_lon = (lon_min, lon_max),
@@ -312,13 +355,6 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     wind_time_iso = wind_time_iso,
         inshore_depth = inshore_depth,
         shelf_slope = shelf_slope,
-        enable_tides = enable_tides,
-    tides_source = tides_source,
-    tidal_constituents = tidal_constituents,
-        tidal_u_amp = tidal_u,
-        tidal_v_amp = tidal_v,
-        s2_u_amp = s2_u,
-        s2_v_amp = s2_v,
         scenario = scenario,
         projection_year = proj_year,
         sim_dt = sim_dt,
@@ -339,6 +375,26 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         diffusivity_v = diff_v,
         enable_dvm = enable_dvm,
         enable_molting = enable_molting,
+        zoea1_day_depth = zoea1_day_depth,
+        zoea1_night_depth = zoea1_night_depth,
+        zoea2_day_depth = zoea2_day_depth,
+        zoea2_night_depth = zoea2_night_depth,
+        megalopa_day_depth = megalopa_day_depth,
+        megalopa_night_depth = megalopa_night_depth,
+        zoea2_depth_factor = zoea2_depth_factor,
+        megalopa_swim_factor = megalopa_swim_factor,
+        t_base = t_base,
+        dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
+        dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
+        dd_megalopa_to_settle = dd_megalopa_to_settle,
+        mortality_base = mortality_base,
+        mortality_thermal_threshold = mortality_thermal_threshold,
+        mortality_thermal_sensitivity = mortality_thermal_sensitivity,
+        mortality_cold_threshold = mortality_cold_threshold,
+        mortality_cold_sensitivity = mortality_cold_sensitivity,
+        settlement_min_depth = settlement_min_depth,
+        settlement_max_depth = settlement_max_depth,
+        settlement_max_temp = settlement_max_temp,
         min_seabed_depth = min_depth,
         buffer_km = buffer_km,
         release_depth_mode = rel_mode,
@@ -346,12 +402,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         enable_initial_ascent = init_ascent,
         ascent_speed = asc_spd,
         ascent_target_depth = asc_target,
-        use_gpu = use_gpu,
-        fallback_to_cpu = fallback_cpu,
-         interactive_map = interactive,
+        use_gpu = false,
+        fallback_to_cpu = false,
+          interactive_map = interactive,
         zarr_path = zarr_path,
-        output_path = output_path,
         storage_backend = storage_backend,
+        enable_zarr = enable_zarr,
         output_dir = output_dir,
         input_dir = input_dir,
         seed = seed,
@@ -380,22 +436,6 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     hydrography_source = hydro_src,
     hydrography_month = hydro_month,
         obc_type = obc_tp,
-        enable_voronoi = enable_voronoi,
-        voronoi_n_units = voronoi_n_units,
-        voronoi_prob_core = voronoi_p_core,
-        voronoi_prob_shallow = voronoi_p_shallow,
-        voronoi_prob_deep = voronoi_p_deep,
-        voronoi_min_res_core_km = voronoi_min_core,
-        voronoi_min_res_shallow_km = voronoi_min_shallow,
-        voronoi_min_res_deep_km = voronoi_min_deep,
-        voronoi_core_depth_min = voronoi_core_min,
-        voronoi_core_depth_max = voronoi_core_max,
-        voronoi_shallow_depth_min = voronoi_shallow_min,
-        voronoi_shallow_depth_max = voronoi_shallow_max,
-        voronoi_deep_depth_min = voronoi_deep_min,
-        voronoi_deep_depth_max = voronoi_deep_max,
-        voronoi_slope_weighting = voronoi_slope_wt,
-        voronoi_slope_factor = voronoi_slope_fac,
         animate_hydro = anim_hydro,
         anim_variable = anim_var,
         anim_fps = anim_fps,
@@ -406,7 +446,6 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         boundary_method = boundary_method,
         sponge_layer_width = sponge_width_val,
         sponge_timescale = sponge_tau_val,
-        tidal_relaxation_timescale = Float64(get_val("tides", "tidal_relaxation_timescale_seconds", 3600.0)),
         u_inflow = u_inflow_val,
         v_inflow = v_inflow_val,
         max_dt = max_dt_val,
@@ -471,13 +510,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "mask_bay_of_fundy" => opts.mask_bay_of_fundy
         ),
         "tides" => Dict{String, Any}(
-            "enable_tides" => opts.enable_tides,
-            "tides_source" => opts.tides_source,
-            "tidal_constituents" => String.(opts.tidal_constituents),
-            "tidal_u_amp" => opts.tidal_u_amp,
-            "tidal_v_amp" => opts.tidal_v_amp,
-            "s2_u_amp" => opts.s2_u_amp,
-            "s2_v_amp" => opts.s2_v_amp
         ),
         "climate" => Dict{String, Any}(
             "scenario" => string(opts.scenario),
@@ -528,6 +560,7 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "storage" => Dict{String, Any}(
             "output_dir" => opts.output_dir,
+            "ocean_model" => opts.hydro_model_file,
             "enable_zarr" => opts.enable_zarr,
             "zarr_path" => opts.zarr_path,
             "run_id" => opts.run_id,
@@ -538,27 +571,8 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "checkpoint_dir" => opts.checkpoint_dir,
             "checkpoint_cleanup" => opts.checkpoint_cleanup
         ),
-        "hardware" => Dict{String, Any}(
-            "use_gpu" => opts.use_gpu,
-            "fallback_to_cpu" => opts.fallback_to_cpu
-        ),
-        "tessellation" => Dict{String, Any}(
-            "enable_voronoi" => opts.enable_voronoi,
-            "n_units" => opts.voronoi_n_units,
-            "prob_core" => opts.voronoi_prob_core,
-            "prob_shallow" => opts.voronoi_prob_shallow,
-            "prob_deep" => opts.voronoi_prob_deep,
-            "min_res_core_km" => opts.voronoi_min_res_core_km,
-            "min_res_shallow_km" => opts.voronoi_min_res_shallow_km,
-            "min_res_deep_km" => opts.voronoi_min_res_deep_km,
-            "core_depth_min" => opts.voronoi_core_depth_min,
-            "core_depth_max" => opts.voronoi_core_depth_max,
-            "shallow_depth_min" => opts.voronoi_shallow_depth_min,
-            "shallow_depth_max" => opts.voronoi_shallow_depth_max,
-            "deep_depth_min" => opts.voronoi_deep_depth_min,
-            "deep_depth_max" => opts.voronoi_deep_depth_max,
-            "slope_weighting" => opts.voronoi_slope_weighting,
-            "slope_factor" => opts.voronoi_slope_factor
+        "runtype" => Dict{String, Any}(
+            "seed" => opts.seed
         ),
         "visualization" => Dict{String, Any}(
             "interactive_map" => opts.interactive_map,
@@ -569,9 +583,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "anim_depth" => opts.anim_depth,
             "anim_overlay_particles" => opts.anim_overlay_particles,
             "anim_output_path" => opts.anim_output_path
-        ),
-        "paths" => Dict{String, Any}(
-            "seed" => opts.seed
         )
     )
 end
@@ -614,11 +625,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :obc_type                 => opts.obc_type,
         :sponge_layer_width       => opts.sponge_layer_width,
         :sponge_timescale         => opts.sponge_timescale,
-        :enable_tides             => opts.enable_tides,
-        :tides_source             => Symbol(opts.tides_source),
-        :tidal_constituents       => opts.tidal_constituents,
-        :tidal_u_amp              => opts.tidal_u_amp,
-        :tidal_v_amp              => opts.tidal_v_amp,
         :cd_drag                  => 0.0025,
         :bottom_drag              => 0.0001,
         :bbl_mixing_closure       => :tke,
@@ -634,7 +640,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
          :min_dt_seconds           => opts.min_dt_seconds,
          :coriolis_latitude        => 44.5,
          :divergence_limit         => 20.0,
-         :output_path              => opts.output_path,
+         :output_path              => opts.output_dir,
          :storage_backend          => opts.storage_backend,
          :output_schedule_seconds  => opts.output_schedule_seconds,
          :enable_checkpoint        => opts.enable_checkpoint,
@@ -661,9 +667,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         Bool(d[:climatology]), Float64(d[:mhw_temp_anomaly]),
         Symbol(d[:ocean_boundary_source]), Symbol(d[:obc_type]),
         Float64(d[:sponge_layer_width]), Float64(d[:sponge_timescale]),
-        Bool(d[:enable_tides]), Symbol(d[:tides_source]),
-        Vector{Symbol}(d[:tidal_constituents]), Float64(d[:tidal_u_amp]),
-        Float64(d[:tidal_v_amp]), Float64(d[:cd_drag]),
         Float64(d[:bottom_drag]), Symbol(d[:bbl_mixing_closure]),
         Float64(d[:sim_duration_seconds]), Float64(d[:sim_dt_seconds]),
         Bool(d[:adaptive_cfl]), Float64(d[:target_cfl]),
@@ -698,27 +701,34 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         :ascent_speed             => opts.ascent_speed,
         :ascent_target_depth      => opts.ascent_target_depth,
         :enable_dvm               => opts.enable_dvm,
-        :megalopa_day_depth       => -120.0,
-        :megalopa_night_depth     => -60.0,
-        :zoea2_depth_factor       => 1.2,
-        :megalopa_swim_factor     => 1.5,
+        :zoea1_day_depth          => opts.zoea1_day_depth,
+        :zoea1_night_depth        => opts.zoea1_night_depth,
+        :zoea2_day_depth          => opts.zoea2_day_depth,
+        :zoea2_night_depth        => opts.zoea2_night_depth,
+        :megalopa_day_depth       => opts.megalopa_day_depth,
+        :megalopa_night_depth     => opts.megalopa_night_depth,
+        :zoea2_depth_factor       => opts.zoea2_depth_factor,
+        :megalopa_swim_factor     => opts.megalopa_swim_factor,
         :enable_molting           => opts.enable_molting,
-        :t_base                   => -1.5,
-        :dd_zoea1_to_zoea2        => 65.0,
-        :dd_zoea2_to_megalopa     => 130.0,
-        :dd_megalopa_to_settle    => 200.0,
-        :mortality_base           => 0.02,
-        :mortality_thermal_thresh => 7.0,
-        :mortality_thermal_sens   => 0.35,
-        :mortality_cold_thresh    => -1.5,
-        :mortality_cold_sens      => 0.02,
-        :settlement_min_depth     => -250.0,
-        :settlement_max_depth     => -50.0,
-        :settlement_max_temp      => 6.0,
+        :t_base                   => opts.t_base,
+        :dd_zoea1_to_zoea2        => opts.dd_zoea1_to_zoea2,
+        :dd_zoea2_to_megalopa     => opts.dd_zoea2_to_megalopa,
+        :dd_megalopa_to_settle    => opts.dd_megalopa_to_settle,
+        :mortality_base           => opts.mortality_base,
+        :mortality_thermal_thresh => opts.mortality_thermal_threshold,
+        :mortality_thermal_sens   => opts.mortality_thermal_sensitivity,
+        :mortality_cold_thresh    => opts.mortality_cold_threshold,
+        :mortality_cold_sens      => opts.mortality_cold_sensitivity,
+        :settlement_min_depth     => opts.settlement_min_depth,
+        :settlement_max_depth     => opts.settlement_max_depth,
+        :settlement_max_temp      => opts.settlement_max_temp,
         :settlement_stochastic    => opts.settlement_stochastic,
         :cv_molt                  => opts.cv_molt,
         :cv_mortality             => opts.cv_mortality,
         :cv_settlement            => opts.cv_settlement,
+        :enable_checkpoint        => opts.enable_checkpoint,
+        :output_path              => opts.output_dir,
+        :storage_backend          => opts.storage_backend,
         :enable_zarr            => opts.enable_zarr,
         :zarr_path              => opts.zarr_path,
         :run_id                   => opts.run_id,
@@ -736,6 +746,8 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         (Float64(d[:bottom_release_offset][1]), Float64(d[:bottom_release_offset][2])),
         Bool(d[:enable_initial_ascent]), Float64(d[:ascent_speed]),
         Float64(d[:ascent_target_depth]), Bool(d[:enable_dvm]),
+        Float64(d[:zoea1_day_depth]), Float64(d[:zoea1_night_depth]),
+        Float64(d[:zoea2_day_depth]), Float64(d[:zoea2_night_depth]),
         Float64(d[:megalopa_day_depth]), Float64(d[:megalopa_night_depth]),
         Float64(d[:zoea2_depth_factor]), Float64(d[:megalopa_swim_factor]),
         Bool(d[:enable_molting]), Float64(d[:t_base]),
