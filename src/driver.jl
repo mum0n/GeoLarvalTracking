@@ -1,7 +1,29 @@
 using Dates
 using Random
 using Statistics
- 
+
+"""
+    DEFAULT_RUN_ID
+
+The identifier a run is archived under when the configuration names none.
+
+The store holds one run per configuration directory, so a fixed name is what says "this
+run" rather than naming a climate pathway. A configuration that wants a second run beside
+it names it in `[storage] run_id`.
+"""
+const DEFAULT_RUN_ID = "run"
+
+"""
+    run_identifier(opts::HydrodynamicOptions) -> String
+
+The identifier this run is archived under in the trajectory store: the configured
+`[storage] run_id` when there is one, and [`DEFAULT_RUN_ID`](@ref) otherwise.
+"""
+function run_identifier(opts::HydrodynamicOptions)::String
+    tag = strip(opts.run_id)
+    return isempty(tag) ? DEFAULT_RUN_ID : String(tag)
+end
+
 """
     resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
 
@@ -377,7 +399,7 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
     )
 
     # Maintain default checkpoint as fallback when custom run_id is supplied
-    if !isempty(opts.run_id)
+    if !isempty(strip(opts.run_id))
         default_cp = joinpath(opts.output_dir, "larval_trajectories.jld2")
         try
             cp(track_checkpoint, default_cp, force = true)
@@ -391,14 +413,13 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
             println("Archiving trajectories to Zarr -> $(opts.zarr_path)...")
             db = open_storage(opts.zarr_path)
             try
-                target_run_id = !isempty(opts.run_id) ? opts.run_id :
-                    "run_$(opts.scenario)_$(opts.projection_year)"
+                target_run_id = run_identifier(opts)
                 save_simulation_run!(
                     db, target_run_id, opts;
                     trajectories = trajectories,
                     config = options_to_configuration(opts),
-                    notes = "Hydrodynamic tracking run ($(opts.scenario), $(opts.projection_year))" *
-                            (!isempty(opts.run_id) ? " [$(opts.run_id)]" : "")
+                    notes = "Larval tracking run" *
+                            (!isempty(strip(opts.run_id)) ? " [$(opts.run_id)]" : "")
                 )
                 println("Trajectories for '$(target_run_id)' successfully archived in Zarr.")
             finally
@@ -522,8 +543,7 @@ function run_segment_metrics(;
             println("Archiving simulation run and metrics to Zarr -> $(opts.zarr_path)...")
             db = open_storage(opts.zarr_path)
             try
-                target_run_id = !isempty(opts.run_id) ? opts.run_id :
-                    "run_$(opts.scenario)_$(opts.projection_year)"
+                target_run_id = run_identifier(opts)
                 save_simulation_run!(
                     db,
                     target_run_id,
@@ -551,8 +571,8 @@ function run_segment_metrics(;
                         sample_count = emp_mov.sample_count
                     ),
                     config = active_config,
-                    notes = "Hydrodynamic workflow run ($(opts.scenario), $(opts.projection_year))" *
-                            (!isempty(opts.run_id) ? " [$(opts.run_id)]" : "")
+                    notes = "Larval workflow run" *
+                            (!isempty(strip(opts.run_id)) ? " [$(opts.run_id)]" : "")
                 )
                 println("Zarr run '$(target_run_id)' successfully archived.")
             finally
@@ -712,7 +732,7 @@ end
 Load the trajectory set of the configured run for Segments 7 and 8.
 
 Sources, in order:
-1. Analytical storage (`opts.zarr_path`, run id `opts.run_id` or `run_<scenario>_<year>`). If the JLD2
+1. Analytical storage (`opts.zarr_path`, run id `run_identifier(opts)`). If the JLD2
    checkpoint describes the same cohort (equal `ids` and `times`), the checkpoint is used
    instead, because it also holds `stage_survival`, `ascent_duration` and the true
    `settlement_age`, none of which analytical storage stores.
@@ -723,9 +743,8 @@ The result is passed through [`_complete_stage_diagnostics`](@ref), so every sou
 same set of stage fields.
 """
 function load_run_trajectories(opts::HydrodynamicOptions)
-    target_run_id = !isempty(opts.run_id) ? opts.run_id :
-        "run_$(opts.scenario)_$(opts.projection_year)"
-    tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
+    target_run_id = run_identifier(opts)
+    tag = !isempty(strip(opts.run_id)) ? "_$(opts.run_id)" : ""
     tagged_cp = joinpath(opts.output_dir, "larval_trajectories$(tag).jld2")
     track_cp = isfile(tagged_cp) ? tagged_cp :
                joinpath(opts.output_dir, "larval_trajectories.jld2")
@@ -770,7 +789,7 @@ end
     ) -> NamedTuple
 
 Generate and export publication-ready CairoMakie figures and standalone
-interactive Leaflet HTML dashboards with multi-scenario comparison and
+    interactive Leaflet HTML dashboards with multi-run comparison and
 rich spatial layers.
 
 # Outputs
@@ -812,7 +831,7 @@ function run_segment_visualize(;
         target_trajs,
         bathymetry_data = bathy_data,
         strata = cfa_polys,
-        title = "Snow Crab Larval Dispersal ($(opts.scenario), Year $(opts.projection_year))",
+        title = "Snow Crab Larval Dispersal",
         output_path = fig1_path
     )
 
@@ -890,8 +909,7 @@ function run_segment_visualize(;
         try
             db_h = open_storage(opts.zarr_path; read_only = true)
             try
-                target_run_id = !isempty(opts.run_id) ? opts.run_id :
-                    "run_$(opts.scenario)_$(opts.projection_year)"
+                target_run_id = run_identifier(opts)
                 load_hydrodynamic_field(db_h, target_run_id)
             finally
                 close_storage(db_h)
@@ -984,7 +1002,7 @@ function run_segment_visualize(;
         hydro_source = if !isnothing(active_hydro)
             active_hydro
         else
-            default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
+            default_jld2 = "hydrodynamics.jld2"
             resolved_jld2, _ = resolve_hydro_model_path(opts, default_jld2)
             isfile(resolved_jld2) ? resolved_jld2 : nothing
         end
@@ -1027,26 +1045,25 @@ function run_segment_visualize(;
         end
     end
 
-    # 9. Query Archived Scenarios from Zarr for Cross-Scenario Comparison & Multi-Layer Interactive Map
-    scenarios_bundle = Dict{String, Any}()
+    # 9. Query Archived Runs from Zarr for Cross-Run Comparison & Multi-Layer Interactive Map
+    runs_bundle = Dict{String, Any}()
     if opts.enable_zarr && isdir(opts.zarr_path)
         try
             db = open_storage(opts.zarr_path; read_only = true)
             try
                 runs_df = list_simulation_runs(db)
                 for r in eachrow(runs_df)
-                    s_id = string(r.run_id)
-                    s_label = "$(r.scenario) ($(r.projection_year))"
+                    r_id = string(r.run_id)
                     try
-                        s_trajs = load_trajectories_namedtuple(db, s_id)
-                        s_disp = try load_gridded_dispersal(db, s_id) catch; nothing end
-                        s_conn = try load_connectivity_matrix(db, s_id) catch; nothing end
-                        s_hydro = try load_hydrodynamic_field(db, s_id) catch; nothing end
-                        scenarios_bundle[s_label] = (
-                            trajectories = s_trajs,
-                            gridded_dispersal = s_disp,
-                            connectivity = s_conn,
-                            hydrodynamics = s_hydro
+                        r_trajs = load_trajectories_namedtuple(db, r_id)
+                        r_disp = try load_gridded_dispersal(db, r_id) catch; nothing end
+                        r_conn = try load_connectivity_matrix(db, r_id) catch; nothing end
+                        r_hydro = try load_hydrodynamic_field(db, r_id) catch; nothing end
+                        runs_bundle[r_id] = (
+                            trajectories = r_trajs,
+                            gridded_dispersal = r_disp,
+                            connectivity = r_conn,
+                            hydrodynamics = r_hydro
                         )
                     catch
                     end
@@ -1058,8 +1075,8 @@ function run_segment_visualize(;
         end
     end
 
-    if isempty(scenarios_bundle) && !isnothing(target_trajs)
-        scenarios_bundle["$(opts.scenario) ($(opts.projection_year))"] = (
+    if isempty(runs_bundle) && !isnothing(target_trajs)
+        runs_bundle[run_identifier(opts)] = (
             trajectories = target_trajs,
             gridded_dispersal = (
                 lon_centers = emp_mov.lon_centers,
@@ -1077,66 +1094,17 @@ function run_segment_visualize(;
         )
     end
 
-    # Cross-scenario 2D figure
-    fig10_path = joinpath(opts.output_dir, "climate_scenario_comparison.png")
-    println("Rendering cross-scenario climate comparison -> $(fig10_path)...")
-    scenario_comp = Dict{Symbol, Any}()
-    for (s_label, s_data) in scenarios_bundle
-        scenario_comp[Symbol(s_label)] = s_data.trajectories
+    # Cross-run 2D figure
+    fig10_path = joinpath(opts.output_dir, "run_comparison.png")
+    println("Rendering cross-run comparison -> $(fig10_path)...")
+    run_comp = Dict{Symbol, Any}()
+    for (r_label, r_data) in runs_bundle
+        run_comp[Symbol(r_label)] = r_data.trajectories
     end
 
-    if length(scenario_comp) < 2
-        flow_ssp585(lon, lat, z, t) = (0.09 + 0.03 * sin(t / 43200.0), -0.04, 0.0001)
-        rng_comp = MersenneTwister(opts.seed + 100)
-        larvae_comp = initialize_larval_particles(
-            min(opts.n_particles, 50),
-            lon_range = (opts.domain_lon[1] + 2.0, opts.domain_lon[2] - 3.0),
-            lat_range = (opts.domain_lat[1] + 1.0, opts.domain_lat[2] - 1.0),
-            min_seabed_depth = opts.min_seabed_depth,
-            bathymetry = bathy_field_fn,
-            rng = rng_comp
-        )
-        trajs_ssp585 = track_larval_cohort(
-            larvae_comp,
-            velocity_fn = flow_ssp585,
-            total_duration = opts.track_duration,
-            dt = opts.track_dt,
-            # Same biology as the primary cohort, so the cross-scenario comparison is not
-            # confounded by one branch running deterministic biology and the other stochastic.
-            enable_molting = opts.enable_molting,
-            cv_molt = opts.cv_molt,
-            cv_mortality = opts.cv_mortality,
-            cv_settlement = opts.cv_settlement,
-            settlement_stochastic = opts.settlement_stochastic,
-            # The same biology as the primary cohort, parameter for parameter.
-            t_base = opts.t_base,
-            dd_zoea1_to_zoea2 = opts.dd_zoea1_to_zoea2,
-            dd_zoea2_to_megalopa = opts.dd_zoea2_to_megalopa,
-            dd_megalopa_to_settle = opts.dd_megalopa_to_settle,
-            mortality_base = opts.mortality_base,
-            mortality_thermal_threshold = opts.mortality_thermal_threshold,
-            mortality_thermal_sensitivity = opts.mortality_thermal_sensitivity,
-            mortality_cold_threshold = opts.mortality_cold_threshold,
-            mortality_cold_sensitivity = opts.mortality_cold_sensitivity,
-            settlement_min_depth = opts.settlement_min_depth,
-            settlement_max_depth = opts.settlement_max_depth,
-            settlement_max_temp = opts.settlement_max_temp,
-            zoea1_day_depth = opts.zoea1_day_depth,
-            zoea1_night_depth = opts.zoea1_night_depth,
-            zoea2_day_depth = opts.zoea2_day_depth,
-            zoea2_night_depth = opts.zoea2_night_depth,
-            megalopa_day_depth = opts.megalopa_day_depth,
-            megalopa_night_depth = opts.megalopa_night_depth,
-            zoea2_depth_factor = opts.zoea2_depth_factor,
-            megalopa_swim_factor = opts.megalopa_swim_factor,
-            rng = rng_comp
-        )
-        scenario_comp[:ssp585_2050] = trajs_ssp585
-    end
-
-    compare_scenario_dispersal(
-        scenario_comp,
-        title = "Scotian Shelf Snow Crab Dispersal Across Climate Scenarios",
+    compare_run_dispersal(
+        run_comp,
+        title = "Snow Crab Larval Dispersal Across Archived Runs",
         output_path = fig10_path
     )
 
@@ -1146,7 +1114,7 @@ function run_segment_visualize(;
         println("Rendering multi-layer interactive Leaflet dashboard with hydrodynamic fields -> $(html_path)...")
         export_interactive_tracks_html(
             html_path;
-            scenarios_data = scenarios_bundle,
+            runs_data = runs_bundle,
             hydrodynamics = active_hydro,
             strata_definitions = cfa_defs,
             title = "Scotian Shelf Snow Crab Larval Dispersal & Demographic Connectivity"
@@ -1205,7 +1173,6 @@ function run_cli_list_runs(; opts::HydrodynamicOptions = HydrodynamicOptions())
     for row in eachrow(df)
         println("-----------------------------------------------------------------")
         println("Run ID:          $(row.run_id)")
-        println("Scenario:        $(row.scenario) (Year $(row.projection_year))")
         println("Created:         $(row.created_at)")
         println("Particles:       $(row.n_particles) larvae | Duration: $(round(row.duration_days, digits=1)) days")
         println("Recruitment:     $(round(row.settlement_success_rate * 100, digits=2))% successful")
@@ -1218,29 +1185,29 @@ end
 
 
 """
-    run_cli_compare_scenarios(; opts::HydrodynamicOptions)
+    run_cli_compare_runs(; opts::HydrodynamicOptions)
 
-Query and print comparative metrics across archived climate scenarios in Zarr.
+Query and print comparative metrics across archived runs in Zarr.
 """
-function run_cli_compare_scenarios(; opts::HydrodynamicOptions = HydrodynamicOptions())
+function run_cli_compare_runs(; opts::HydrodynamicOptions = HydrodynamicOptions())
     if !isdir(opts.zarr_path)
         println("No Zarr storage found at: $(opts.zarr_path)")
         return
     end
     println("\n=================================================================")
-    println(" Multi-Scenario Comparative Analysis from Zarr")
+    println(" Multi-Run Comparative Analysis from Zarr")
     println("=================================================================")
     db = open_storage(opts.zarr_path; read_only = true)
-    df = compare_scenarios(db)
+    df = compare_runs(db)
     close_storage(db)
 
     if nrow(df) == 0
-        println("No simulation data available for scenario comparison.")
+        println("No simulation data available for run comparison.")
         return
     end
 
     for row in eachrow(df)
-        println("Scenario: $(rpad(row.scenario, 16)) | Year: $(row.projection_year) | Runs: $(row.n_runs)")
+        println("Run: $(rpad(row.run_id, 16)) | Archived runs: $(row.n_runs)")
         println("  Settlement Success: $(round(row.mean_settlement_success * 100, digits=2))%")
         println("  Mean PLD:           $(round(row.mean_pld_days, digits=1)) days")
         println("  Mean Exposure Temp: $(round(row.mean_temperature_celsius, digits=2)) °C")
@@ -1263,7 +1230,7 @@ function run_cli_model_average(; opts::HydrodynamicOptions = HydrodynamicOptions
         return
     end
     println("\n=================================================================")
-    println(" Multi-Scenario Ensemble Model Averaging")
+    println(" Multi-Run Ensemble Model Averaging")
     println("=================================================================")
     db = open_storage(opts.zarr_path; read_only = true)
     runs_df = list_simulation_runs(db)
@@ -1274,9 +1241,9 @@ function run_cli_model_average(; opts::HydrodynamicOptions = HydrodynamicOptions
         return
     end
 
-    scens = unique(runs_df.scenario)
-    println("Averaging across $(length(scens)) scenario models: $(join(scens, ", "))")
-    ens = compute_ensemble_model_average(db, scens)
+    run_ids = unique(runs_df.run_id)
+    println("Averaging across $(length(run_ids)) archived runs: $(join(run_ids, ", "))")
+    ens = compute_ensemble_model_average(db, run_ids)
     close_storage(db)
 
     println("\nEnsemble Weighted Settlement Success: $(round(ens.mean_recruitment_rate * 100, digits=2))%")
@@ -1450,10 +1417,3 @@ _run_bathymetry_source(args...; kwargs...) = error("`_run_bathymetry_source` is 
 Owned by the OCEAN half. GeoLarvalTracking calls into neither package's ocean half: importing it would be the edge SPLIT_PLAN.md section 1 forbids. A larval `--viz` that renders a hydrodynamic field is this package describing the ocean, and should read the store the ocean half wrote.
 """
 expand_domain_with_buffer(args...; kwargs...) = error("`expand_domain_with_buffer` is owned by GeoOceanModel, not by this package.")
-
-"""
-    flow_ssp585(args...; kwargs...)
-
-Owned by the OCEAN half. GeoLarvalTracking calls into neither package's ocean half: importing it would be the edge SPLIT_PLAN.md section 1 forbids. A larval `--viz` that renders a hydrodynamic field is this package describing the ocean, and should read the store the ocean half wrote.
-"""
-flow_ssp585(args...; kwargs...) = error("`flow_ssp585` is owned by GeoOceanModel, not by this package.")

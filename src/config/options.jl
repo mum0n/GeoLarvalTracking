@@ -25,8 +25,6 @@ Runtime parameter specification for regional hydrodynamic circulation,
   `[data] bathy_source` (for example `"etopo2022"`, `"synthetic"`). There is no separate
   real/synthetic switch: acquisition always reads the named product, and falls back to analytic
   fields with a warning if a download fails.
-- `scenario::Symbol`: Climate scenario (:historical, :ssp126, :ssp245, :ssp585, :mhw).
-- `projection_year::Int`: Target climate scenario year (e.g. 2050).
 - `sim_dt::Float64`: Initial hydrodynamic integration time step in seconds.
 - `sim_duration::Float64`: Total hydrodynamic simulation duration in seconds.
 - `adaptive_cfl::Bool`: Whether to adaptively modulate hydrodynamic time stepping.
@@ -91,8 +89,6 @@ struct HydrodynamicOptions
     wind_time_iso            :: String
     inshore_depth            :: Float64
     shelf_slope              :: Float64
-    scenario                 :: Symbol
-    projection_year          :: Int
     sim_dt                   :: Float64
     sim_duration             :: Float64
     min_dt_seconds           :: Float64
@@ -279,9 +275,7 @@ function HydrodynamicOptions(;
     wind_source            :: AbstractString = "open_meteo",
     wind_time_iso          :: AbstractString = "2020-06-01T00:00:00Z",
     inshore_depth          :: Real = -20.0,
-    shelf_slope            :: Real = 500.0,
-    scenario              :: Symbol = :ssp245,
-    projection_year       :: Int = 2050,
+    shelf_slope          :: Real = 500.0,
     sim_dt                :: Real = 120.0,
     sim_duration          :: Real = 43200.0,
     min_dt_seconds        :: Real = 2.0,
@@ -405,8 +399,6 @@ function HydrodynamicOptions(;
         wind_time_iso,
         Float64(inshore_depth),
         Float64(shelf_slope),
-        scenario,
-        projection_year,
         Float64(sim_dt),
         Float64(sim_duration),
         Float64(min_dt_seconds),
@@ -535,7 +527,6 @@ struct HydrodynamicConfig
     drag_formulation         :: Symbol
     bulk_heat_flux           :: Bool
     climatology              :: Bool
-    mhw_temp_anomaly         :: Float64
     ocean_boundary_source    :: Symbol
     obc_type                 :: Symbol
     sponge_layer_width       :: Float64

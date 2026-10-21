@@ -76,9 +76,6 @@ function configuration_to_options(config_dict::AbstractDict;
     # case-sensitively, while the atlas file lookup is case-insensitive. Normalising here
 
 
-    scenario = Symbol(get_val("climate", "scenario", "ssp245"))
-    proj_year = Int(get_val("climate", "projection_year", 2050))
-
     sim_hours = Float64(get_val("hydrodynamics", "sim_duration_hours", 12.0))
     sim_dt    = Float64(get_val("hydrodynamics", "sim_dt_seconds", 120.0))
     # Floor on the adaptive time step, forwarded to the simulation as `min_Δt`. The surface cell
@@ -227,8 +224,8 @@ function configuration_to_options(config_dict::AbstractDict;
      # configurable and NOT shared between runs: a single top-level `inputs/` let a run
      # with a changed domain silently reuse another domain's bathymetry, which is exactly
      # the quiet mismatch `resolved_config.toml` and `data_provenance.json` exist to
-     # expose. The cost is disk -- a dataset is fetched once per scenario rather than once
-     # per machine -- and that is the intended trade, because it makes each scenario a
+     # expose. The cost is disk -- a dataset is fetched once per configuration rather than once
+     # per machine -- and that is the intended trade, because it makes each configuration a
      # self-contained, shareable directory.
      input_dir  = joinpath(output_dir, "inputs")
      # The trajectory store and the restart archives are part of this run's output
@@ -355,8 +352,6 @@ function configuration_to_options(config_dict::AbstractDict;
     wind_time_iso = wind_time_iso,
         inshore_depth = inshore_depth,
         shelf_slope = shelf_slope,
-        scenario = scenario,
-        projection_year = proj_year,
         sim_dt = sim_dt,
         sim_duration = sim_hours * 3600.0,
         min_dt_seconds = min_dt_seconds,
@@ -511,10 +506,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "tides" => Dict{String, Any}(
         ),
-        "climate" => Dict{String, Any}(
-            "scenario" => string(opts.scenario),
-            "projection_year" => opts.projection_year
-        ),
         "hydrodynamics" => Dict{String, Any}(
             "sim_duration_hours" => opts.sim_duration / 3600.0,
             "sim_dt_seconds" => opts.sim_dt,
@@ -618,7 +609,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :drag_formulation         => :garratt_1977,
         :bulk_heat_flux           => true,
         :climatology              => false,
-        :mhw_temp_anomaly         => opts.scenario == :mhw ? 3.5 : 0.0,
         :ocean_boundary_source    => opts.ocean_boundary_source,
         :hydrography_source       => opts.hydrography_source,
         :hydrography_month        => opts.hydrography_month,
@@ -664,7 +654,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         String(d[:bathy_source]), String(d[:coastline_source]), String(d[:wind_source]), String(d[:wind_time_iso]), Float64(d[:inshore_depth]),
         Float64(d[:shelf_slope]), Symbol(d[:atmospheric_source]),
         Symbol(d[:drag_formulation]), Bool(d[:bulk_heat_flux]),
-        Bool(d[:climatology]), Float64(d[:mhw_temp_anomaly]),
+        Bool(d[:climatology]),
         Symbol(d[:ocean_boundary_source]), Symbol(d[:obc_type]),
         Float64(d[:sponge_layer_width]), Float64(d[:sponge_timescale]),
         Float64(d[:bottom_drag]), Symbol(d[:bbl_mixing_closure]),

@@ -50,7 +50,8 @@ end
 using GeoLarvalTracking
 using GeoLarvalTracking: configuration_to_options, options_to_configuration,
     save_configuration, load_configuration, resolve_config_name, run_segment_tracking,
-    run_segment_metrics, run_segment_visualize, render_all_figures
+    run_segment_metrics, run_segment_visualize, render_all_figures, HydrodynamicOptions
+using GeoData
 
 """
     display_help(io::IO = stdout)
@@ -71,6 +72,15 @@ function display_help(io::IO = stdout)
       --quick      A short unsaved run to check the configuration still works. Writes
                    nothing that a later --rerun would need to skip.
       --viz        Render the figures from the stored results, without re-tracking.
+
+    Clearing what a previous run left behind:
+      --blank_state  Wipe ALL of this run's state, the downloaded store included: the
+                    trajectory store, the trajectory archives, the restart checkpoints, and
+                    the ingested inputs. The next run fetches the inputs again. Asks
+                    before it deletes.
+      --force and --overwrite also ask before they delete, and they delete the MODEL
+      RESULTS only: the trajectory store, the trajectory archives and the restart
+      checkpoints. The downloaded store is kept, so the run does not fetch it again.
 
     Configuration:
       --config=FILE        A path, or a name resolved against configs/.
@@ -106,7 +116,7 @@ guessing which they meant is how a long run happens instead of a figure.
 function parse_args(args::Vector{String})
     out = Dict{String, Any}(
         "verb" => nothing, "config" => "", "hydro_file" => "", "save_config" => nothing,
-        "help" => false)
+        "blank_state" => false, "help" => false)
     verbs = Set(["--rerun", "--force", "--overwrite", "--quick", "--viz"])
     for a in args
         if a in verbs
@@ -115,6 +125,8 @@ function parse_args(args::Vector{String})
                 "Two verbs given: --$(verb_name) and --$(out["verb"]). Name one; " *
                 "which one was meant is not a thing this script should guess.")
             out["verb"] = verb_name
+        elseif a in ("--blank_state", "--blank-state")
+            out["blank_state"] = true
         elseif a in ("--help", "-h")
             out["help"] = true
         elseif a == "--save-config"
@@ -160,16 +172,57 @@ function resolve_config_path(flag::AbstractString)::String
           "(for example: default, snowcrab).")
 end
 
+"""
+    clear_run_state(opts::HydrodynamicOptions; blank_state::Bool, input = stdin) -> Bool
+
+Clear what a previous run of this configuration left behind, after warning about it and
+being told to go ahead. Returns `false` when the operator declined, in which case the
+caller must not run.
+
+Two kinds of state live in this run's output directory, and the two flags mean different
+things because of it:
+
+  * the MODEL RESULTS -- the trajectory store, the trajectory archives and the restart
+    checkpoints. `--force` clears these and keeps the rest.
+  * the DOWNLOADED STORE -- this run's `inputs/`: the coastal polygons and the vertical
+    grid. `--blank_state` clears these as well, so the next run fetches them again.
+
+The shared GeoData store under the lakehouse is never touched: it holds the ocean half's
+flow solution, which this half tracks through and does not own.
+
+`input` is the stream the answer is read from: `stdin` in a run, and a buffer when the
+run is being driven from a script.
+"""
+function clear_run_state(opts::HydrodynamicOptions; blank_state::Bool = false,
+                        input::IO = stdin)
+    out_dir = opts.output_dir
+    tag = !isempty(opts.run_id) ? "_$(opts.run_id)" : ""
+    results = [opts.zarr_path,
+               joinpath(out_dir, "larval_trajectories.jld2"),
+               joinpath(out_dir, "larval_trajectories$(tag).jld2")]
+    result_globs = isempty(strip(opts.checkpoint_dir)) ? String[] :
+                   [joinpath(opts.checkpoint_dir, "*.jld2")]
+    inputs = [opts.input_dir]
+    return GeoData.purge_run_state(out_dir; results, result_globs, inputs,
+                                   blank_state = blank_state, input = input)
+end
+
 function main(args::Vector{String})
     flags = parse_args(args)
     flags["help"] && return display_help()
 
     cfg_file = resolve_config_file(flags["config"])
+    # "Overwrite" is a property of the RUN, and it is carried in the options rather than set
+    # on them: `HydrodynamicOptions` is immutable, and a resolved options struct that could
+    # be edited after the fact would not be a resolved struct. The configuration's own
+    # `overwrite` is left alone when the flags do not ask for one.
+    overwrite_requested = flags["verb"] == "force" || flags["blank_state"]
     opts = try
         # The configuration's own name is passed on: it is what names this run's directory
         # in the lakehouse when the configuration does not name one itself.
         configuration_to_options(load_configuration(cfg_file);
-                                 config_name = resolve_config_name(cfg_file))
+                                 config_name = resolve_config_name(cfg_file),
+                                 (overwrite_requested ? (; overwrite = true) : (;))...)
     catch err
         println("Configuration error: $(sprint(showerror, err))")
         return display_help()
@@ -179,6 +232,10 @@ function main(args::Vector{String})
     # fully-resolved configuration, then exit. (A run needs a verb; inspecting the config does
     # not.)
     if !isnothing(flags["save_config"])
+        if flags["blank_state"]
+            error("--save-config writes the resolved configuration and exits; it cannot also " *
+                  "clear a previous run's state. Run them one at a time.")
+        end
         dest = isempty(flags["save_config"]) ? cfg_file : flags["save_config"]
         save_configuration(options_to_configuration(opts), dest)
         println("Resolved configuration written to $(dest)")
@@ -186,6 +243,15 @@ function main(args::Vector{String})
     end
 
     isnothing(flags["verb"]) && return display_help()
+
+    if flags["blank_state"] && flags["verb"] == "viz"
+        error("--viz renders the figures from the stored results, so it cannot also wipe " *
+              "them. Use --rerun or --force with --blank_state.")
+    end
+    if flags["blank_state"] && flags["verb"] == "quick"
+        error("--quick writes nothing that a later --rerun would need, so it cannot also " *
+              "wipe a previous run's state. Use --rerun or --force with --blank_state.")
+    end
 
     println("="^73)
     println(" GeoLarvalTracking")
@@ -206,8 +272,16 @@ function main(args::Vector{String})
     end
 
     if flags["verb"] == "rerun" || flags["verb"] == "force" || flags["verb"] == "quick"
-        if flags["verb"] == "force"
-            opts.overwrite = true
+        # What a previous run left behind is cleared BEFORE the tracking starts, so the run
+        # that follows sees the state it is meant to see. --force clears the model results
+        # and keeps the downloaded store; --blank_state clears both, so the inputs are
+        # fetched again. Either way the operator is asked first.
+        if flags["verb"] == "force" || flags["blank_state"]
+            cleared = clear_run_state(opts; blank_state = flags["blank_state"])
+            if !cleared
+                println("Aborted: the existing state was left untouched.")
+                return nothing
+            end
         end
         # A rerun reads what the existing store says and skips what it already covers; --force /
         # --overwrite replaces stored results and re-tracks from t = 0. --quick runs tracking

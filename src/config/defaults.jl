@@ -17,7 +17,7 @@ Locate the configuration file in the project workspace, or return `""` when ther
 Only project-root locations are searched. A configuration is an input the operator supplies;
 it is never discovered inside a previous run's containerised `inputs/` directory, and it is
 never guessed at. In particular there is no fallback to `configs/default.toml`: a run that
-silently adopts a different scenario than the one intended produces output that looks
+silently adopts a different configuration than the one intended produces output that looks
 complete and answers a question nobody asked. Callers must fail loudly instead, which is what
 `load_configuration` does with an empty path.
 
@@ -176,12 +176,6 @@ function get_default_configuration()::Dict{String, Any}
             "source" => "era5",
             "drag_formulation" => "garratt_1977",
             "bulk_heat_flux" => true
-        ),
-        "climate" => Dict{String, Any}(
-            "scenario" => "ssp245",
-            "projection_year" => 2050,
-            "baseline_year" => 2015,
-            "horizon_year" => 2050
         ),
         "hydrodynamics" => Dict{String, Any}(
             "sim_duration_hours" => 12.0,

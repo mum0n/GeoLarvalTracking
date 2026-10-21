@@ -9,7 +9,7 @@ trajectory steps, cohort recruitment outcomes, demographic connectivity
 matrices, and spatial dispersal fields with:
 - Lagrangian particle trajectories stored in GeoParquet (.parquet) with Point geometries
 - Eulerian hydrodynamic fields stored in chunked Zarr (.zarr) arrays
-- Multi-scenario benchmarking and ensemble model averaging
+- Multi-run benchmarking and ensemble model averaging
 """
 
 using GeoData
@@ -68,12 +68,12 @@ export
     list_simulation_runs,
     load_trajectories_df,
     load_trajectories_namedtuple,
-    load_all_scenario_trajectories,
+    load_all_run_trajectories,
     save_hydrodynamic_field!,
     load_hydrodynamic_field,
     load_gridded_dispersal,
     load_connectivity_matrix,
-    compare_scenarios,
+    compare_runs,
     compute_ensemble_model_average,
     geopublish_lakehouse!
 
@@ -217,8 +217,6 @@ function save_simulation_run!(
 )::String
     canonical_trajs = canonicalize_trajectories(trajectories)
 
-    scenario = string(hasproperty(opts, :scenario) ? opts.scenario : :baseline)
-    proj_year = Int(hasproperty(opts, :projection_year) ? opts.projection_year : 2050)
     n_parts = Int(hasproperty(opts, :n_particles) ? opts.n_particles : size(canonical_trajs.lons, 1))
     duration = Float64(hasproperty(opts, :track_duration) ? opts.track_duration : (canonical_trajs.times[end] - canonical_trajs.times[1]))
     dt_val = Float64(hasproperty(opts, :track_dt) ? opts.track_dt : (length(canonical_trajs.times) > 1 ? canonical_trajs.times[2] - canonical_trajs.times[1] : 300.0))
@@ -263,8 +261,6 @@ function save_simulation_run!(
 
         run_metadata = Dict(
             "run_id" => run_id,
-            "scenario" => scenario,
-            "projection_year" => proj_year,
             "created_at" => created_at,
             "n_particles" => n_parts,
             "duration_seconds" => duration,
@@ -474,8 +470,6 @@ function save_simulation_run!(
         centroid_lat = isempty(col_lat) ? 0.0 : sum(col_lat) / length(col_lat)
         run_row = DataFrame(
             run_id = [String(run_id)],
-            scenario = [scenario],
-            projection_year = [proj_year],
             n_particles = [Int(n_parts)],
             duration_days = [Float64(duration / 86400.0)],
             track_dt_seconds = [Float64(dt_val)],
@@ -573,16 +567,14 @@ end
 """
     list_simulation_runs(
         group::Union{Zarr.ZGroup, GeoParquetStorage};
-        scenario::Union{Nothing, AbstractString, Symbol} = nothing,
-        projection_year::Union{Nothing, Int} = nothing
+        run_id::Union{Nothing, AbstractString} = nothing
     )::DataFrame
 
 Query and return a summary `DataFrame` of all simulation runs in storage.
 """
 function list_simulation_runs(
     group::Union{Zarr.ZGroup, GeoParquetStorage};
-    scenario::Union{Nothing, AbstractString, Symbol} = nothing,
-    projection_year::Union{Nothing, Int} = nothing
+    run_id::Union{Nothing, AbstractString} = nothing
 )::DataFrame
     if group isa Zarr.ZGroup
         if !haskey(group, "runs")
@@ -597,10 +589,7 @@ function list_simulation_runs(
         runs = DataFrame()
         for r_json in runs_json
             r = JSON3.read(r_json)
-            if !isnothing(scenario) && r["scenario"] != string(scenario)
-                continue
-            end
-            if !isnothing(projection_year) && r["projection_year"] != projection_year
+            if !isnothing(run_id) && r["run_id"] != string(run_id)
                 continue
             end
             push!(runs, r)
@@ -614,12 +603,9 @@ function list_simulation_runs(
             return DataFrame()
         end
         runs = GeoParquet.read(runs_path)
-        if !isnothing(scenario)
-            sc_str = string(scenario)
-            filter!(r -> r.scenario == sc_str, runs)
-        end
-        if !isnothing(projection_year)
-            filter!(r -> r.projection_year == projection_year, runs)
+        if !isnothing(run_id)
+            id_str = string(run_id)
+            filter!(r -> r.run_id == id_str, runs)
         end
         if "created_at" in names(runs) && nrow(runs) > 1
             sort!(runs, :created_at, rev = true)
@@ -917,34 +903,33 @@ function load_trajectories_df(
 end
 
 """
-    load_all_scenario_trajectories(
+    load_all_run_trajectories(
         group::Union{Zarr.ZGroup, GeoParquetStorage};
-        projection_year::Union{Nothing, Int} = nothing
+        run_id::Union{Nothing, AbstractString} = nothing
     ) -> Dict{Symbol, NamedTuple}
 
-Load Lagrangian trajectories for all scenarios present in storage.
+Load Lagrangian trajectories for every run present in storage, keyed by run identifier.
 """
-function load_all_scenario_trajectories(
+function load_all_run_trajectories(
     group::Union{Zarr.ZGroup, GeoParquetStorage};
-    projection_year::Union{Nothing, Int} = nothing
+    run_id::Union{Nothing, AbstractString} = nothing
 )
-    runs_df = list_simulation_runs(group; projection_year = projection_year)
+    runs_df = list_simulation_runs(group; run_id = run_id)
     if nrow(runs_df) == 0
         return Dict{Symbol, NamedTuple}()
     end
 
-    scenario_dict = Dict{Symbol, NamedTuple}()
-    for scen_name in unique(runs_df.scenario)
-        subset_df = filter(r -> r.scenario == scen_name, runs_df)
-        latest_run_id = string(subset_df.run_id[1])
+    run_dict = Dict{Symbol, NamedTuple}()
+    for r_id in unique(runs_df.run_id)
+        id_str = string(r_id)
         try
-            scenario_dict[Symbol(scen_name)] = load_trajectories_namedtuple(group, latest_run_id)
+            run_dict[Symbol(id_str)] = load_trajectories_namedtuple(group, id_str)
         catch err
-            @warn "Failed to load trajectories for scenario $(scen_name): $(err)"
+            @warn "Failed to load trajectories for run $(id_str): $(err)"
         end
     end
 
-    return scenario_dict
+    return run_dict
 end
 
 """
@@ -1212,55 +1197,32 @@ function load_connectivity_matrix(
 end
 
 """
-    compare_scenarios(
+    compare_runs(
         group::Union{Zarr.ZGroup, GeoParquetStorage};
-        scenario_names::Union{Nothing, AbstractVector{<:AbstractString}} = nothing,
-        projection_years::Union{Nothing, AbstractVector{Int}} = nothing,
-        scenarios::Union{Nothing, AbstractVector{Symbol}} = nothing,
-        projection_year::Union{Nothing, Int} = nothing
+        run_ids::Union{Nothing, AbstractVector{<:AbstractString}} = nothing
     )::DataFrame
 
-Compare aggregated recruitment and transport metrics across climate projection pathways.
+Compare aggregated recruitment and transport metrics across the archived runs.
 """
-function compare_scenarios(
+function compare_runs(
     group::Union{Zarr.ZGroup, GeoParquetStorage};
-    scenario_names::Union{Nothing, AbstractVector{<:AbstractString}} = nothing,
-    projection_years::Union{Nothing, AbstractVector{Int}} = nothing,
-    scenarios::Union{Nothing, AbstractVector{Symbol}} = nothing,
-    projection_year::Union{Nothing, Int} = nothing
+    run_ids::Union{Nothing, AbstractVector{<:AbstractString}} = nothing
 )::DataFrame
     runs_df = list_simulation_runs(group)
     if nrow(runs_df) == 0
         return DataFrame()
     end
 
-    scen_filter = if !isnothing(scenario_names)
-        [string(s) for s in scenario_names]
-    elseif !isnothing(scenarios)
-        [string(s) for s in scenarios]
-    else
-        nothing
-    end
-    if !isnothing(scen_filter)
-        filter!(r -> r.scenario in scen_filter, runs_df)
-    end
-
-    year_filter = if !isnothing(projection_years)
-        projection_years
-    elseif !isnothing(projection_year)
-        [projection_year]
-    else
-        nothing
-    end
-    if !isnothing(year_filter)
-        filter!(r -> r.projection_year in year_filter, runs_df)
+    if !isnothing(run_ids)
+        wanted = [string(r) for r in run_ids]
+        filter!(r -> string(r.run_id) in wanted, runs_df)
     end
 
     if nrow(runs_df) == 0
         return DataFrame()
     end
 
-    gdf = groupby(runs_df, [:scenario, :projection_year])
+    gdf = groupby(runs_df, :run_id)
     out = combine(gdf) do sdf
         rec = hasproperty(sdf, :settlement_success_rate) ? sdf.settlement_success_rate :
               (hasproperty(sdf, :mean_settlement_success) ? sdf.mean_settlement_success : [0.0])
@@ -1285,34 +1247,34 @@ function compare_scenarios(
             mean_thermal_mortality_rate = mean(mort)
         )
     end
-    sort!(out, [:scenario, :projection_year])
+    sort!(out, :run_id)
     return out
 end
 
 """
     compute_ensemble_model_average(
         group::Union{Zarr.ZGroup, GeoParquetStorage},
-        scenario_names::AbstractVector{<:AbstractString};
+        run_ids::AbstractVector{<:AbstractString};
         weights::Union{Nothing, AbstractVector{<:Real}} = nothing
     ) -> NamedTuple
 
-Compute weighted multi-model ensemble mean and variance across climate scenarios.
+Compute weighted multi-model ensemble mean and variance across archived runs.
 """
 function compute_ensemble_model_average(
     group::Union{Zarr.ZGroup, GeoParquetStorage},
-    scenario_names::AbstractVector{<:AbstractString};
+    run_ids::AbstractVector{<:AbstractString};
     weights::Union{Nothing, AbstractVector{<:Real}} = nothing
 )
-    n_scen = length(scenario_names)
-    if n_scen == 0
-        error("At least one scenario name must be provided for ensemble averaging.")
+    n_runs = length(run_ids)
+    if n_runs == 0
+        error("At least one run identifier must be provided for ensemble averaging.")
     end
 
     w_vec = if isnothing(weights)
-        fill(1.0 / n_scen, n_scen)
+        fill(1.0 / n_runs, n_runs)
     else
-        if length(weights) != n_scen
-            error("Length of weights ($(length(weights))) must match scenario_names ($(n_scen)).")
+        if length(weights) != n_runs
+            error("Length of weights ($(length(weights))) must match run_ids ($(n_runs)).")
         end
         w_sum = sum(weights)
         if w_sum <= 0.0
@@ -1327,15 +1289,15 @@ function compute_ensemble_model_average(
     mort_vals = Float64[]
     strata_names_ref = String[]
 
-    for (s_idx, scen) in enumerate(scenario_names)
-        runs_df = list_simulation_runs(group; scenario = scen)
+    for (r_idx, r_id) in enumerate(run_ids)
+        id_str = string(r_id)
+        runs_df = list_simulation_runs(group; run_id = id_str)
         if nrow(runs_df) == 0
-            error("No runs found in storage for scenario: '$(scen)'.")
+            error("No runs found in storage for run identifier: '$(id_str)'.")
         end
-        latest_run_id = string(runs_df.run_id[1])
-        conn = load_connectivity_matrix(group, latest_run_id)
+        conn = load_connectivity_matrix(group, id_str)
 
-        if s_idx == 1
+        if r_idx == 1
             strata_names_ref = [string(s) for s in conn.strata_names]
         end
 
@@ -1355,11 +1317,11 @@ function compute_ensemble_model_average(
     mean_conn = zeros(Float64, n_strata, n_strata)
     var_conn = zeros(Float64, n_strata, n_strata)
 
-    for m in 1:n_scen
+    for m in 1:n_runs
         mean_conn .+= w_vec[m] .* matrices[m]
     end
 
-    for m in 1:n_scen
+    for m in 1:n_runs
         var_conn .+= w_vec[m] .* ((matrices[m] .- mean_conn) .^ 2)
     end
     std_conn = sqrt.(max.(0.0, var_conn))
@@ -1375,7 +1337,7 @@ function compute_ensemble_model_average(
         mean_recruitment_rate = ens_rec,
         mean_pld_days = ens_pld,
         mean_thermal_exposure = ens_mort,
-        scenarios = scenario_names,
+        run_ids = run_ids,
         weights = w_vec
     )
 end
@@ -1383,11 +1345,10 @@ end
 function compute_ensemble_model_average(
     group::Union{Zarr.ZGroup, GeoParquetStorage};
     variable::Symbol = :mean_pld_days,
-    scenarios::Vector{Symbol} = [:baseline, :ssp245, :ssp585],
-    projection_year::Int = 2050
+    run_ids::Vector{String} = String[]
 )
-    scen_strs = [string(s) for s in scenarios]
-    return compute_ensemble_model_average(group, scen_strs)
+    isempty(run_ids) && (run_ids = [string(r) for r in list_simulation_runs(group).run_id])
+    return compute_ensemble_model_average(group, run_ids)
 end
 
 """
@@ -1395,8 +1356,6 @@ end
                           storage_path::AbstractString;
                           key::Symbol,
                           name::String,
-                          scenario::String = "",
-                          projection_year::Int = 2024,
                           derived_from::Vector{Symbol} = Symbol[])
 
 Publish particle tracking simulation outputs (e.g. dispersal kernels, connectivity)
@@ -1406,8 +1365,6 @@ function geopublish_lakehouse!(catalog::GeoDataSources.CatalogModule.GeoDataCata
                                storage_path::AbstractString;
                                key::Symbol,
                                name::String,
-                               scenario::String = "",
-                               projection_year::Int = 2024,
                                derived_from::Vector{Symbol} = Symbol[])
     return GeoDataSources.geopublish_dataset!(
         catalog,
@@ -1417,7 +1374,6 @@ function geopublish_lakehouse!(catalog::GeoDataSources.CatalogModule.GeoDataCata
         tier = :derived,
         producer = "ParticleTracking.jl",
         derived_from = derived_from,
-        format = endswith(storage_path, ".parquet") ? :geoparquet : :zarr,
-        notes = "Scenario: $(scenario), Year: $(projection_year)"
+        format = endswith(storage_path, ".parquet") ? :geoparquet : :zarr
     )
 end

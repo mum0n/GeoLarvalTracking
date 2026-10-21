@@ -3,7 +3,7 @@
 
 Larval dispersal figures.
 
-Trajectory maps, vertical-migration profiles, scenario comparison, settlement
+Trajectory maps, vertical-migration profiles, run comparison, settlement
 density, empirical movement fields, connectivity and recruitment summaries.
 """
 
@@ -244,14 +244,14 @@ function plot_vertical_migration_profiles(
 end
 
 """
-    compare_scenario_dispersal(
-        scenario_dict::Union{AbstractDict, NamedTuple};
-        title::AbstractString = "Larval Dispersal Across Climate Scenarios",
-        output_path::Union{Nothing, AbstractString} = "outputs/scenario_comparison.png"
+    compare_run_dispersal(
+        run_dict::Union{AbstractDict, NamedTuple};
+        title::AbstractString = "Larval Dispersal Across Runs",
+        output_path::Union{Nothing, AbstractString} = "outputs/run_comparison.png"
     )
 
-Compare spatial trajectories and final dispersion centroids across multiple
-climate forcing scenarios (e.g. `:historical`, `:ssp245`, `:ssp585`).
+Compare spatial trajectories and final dispersion centroids across several
+archived runs.
 
 # Mathematical Formulations
 - **Centroid Center of Mass**:
@@ -261,7 +261,7 @@ climate forcing scenarios (e.g. `:historical`, `:ssp245`, `:ssp585`).
   ```
 
 # Inputs
-- `scenario_dict::Union{AbstractDict, NamedTuple}`: Mapping of scenario names or keys
+- `run_dict::Union{AbstractDict, NamedTuple}`: Mapping of run identifiers or keys
   to trajectory NamedTuples (or data containers holding a `.trajectories` field).
 - `title::AbstractString`: Comparison figure title.
 - `output_path::Union{Nothing, AbstractString}`: Destination filepath to save output.
@@ -272,39 +272,30 @@ climate forcing scenarios (e.g. `:historical`, `:ssp245`, `:ssp585`).
 # References
 - Brickman, D., et al. (2018). *Progress in Oceanography*, 164, 49-64.
 """
-function compare_scenario_dispersal(
-    scenario_dict::Union{AbstractDict, NamedTuple};
-    title::AbstractString = "Larval Dispersal Across Climate Scenarios",
-    output_path::Union{Nothing, AbstractString} = "outputs/scenario_comparison.png"
+function compare_run_dispersal(
+    run_dict::Union{AbstractDict, NamedTuple};
+    title::AbstractString = "Larval Dispersal Across Runs",
+    output_path::Union{Nothing, AbstractString} = "outputs/run_comparison.png"
 )
-    n_scenarios = length(scenario_dict)
-    n_cols = min(n_scenarios, 3)
-    n_rows = ceil(Int, n_scenarios / 3)
+    n_runs = length(run_dict)
+    n_cols = min(n_runs, 3)
+    n_rows = ceil(Int, n_runs / 3)
     fig = Figure(size = (450 * n_cols, 420 * n_rows), fontsize = 12)
 
-    scenario_keys = scenario_dict isa NamedTuple ? keys(scenario_dict) : collect(keys(scenario_dict))
-    colors = Dict(
-        :historical => :royalblue,
-        :baseline => :royalblue,
-        :ssp126 => :seagreen,
-        :ssp245 => :darkorange,
-        :ssp370 => :orangered,
-        :ssp585 => :crimson,
-        :marine_heatwave => :firebrick
-    )
+    run_keys = run_dict isa NamedTuple ? keys(run_dict) : collect(keys(run_dict))
+    palette = (:royalblue, :seagreen, :darkorange, :orangered, :crimson, :firebrick)
 
-    for (s_idx, s_key) in enumerate(scenario_keys)
-        row = div(s_idx - 1, 3) + 1
-        col = mod(s_idx - 1, 3) + 1
+    for (r_idx, r_key) in enumerate(run_keys)
+        row = div(r_idx - 1, 3) + 1
+        col = mod(r_idx - 1, 3) + 1
 
-        raw_val = scenario_dict isa NamedTuple ? getproperty(scenario_dict, s_key) : scenario_dict[s_key]
+        raw_val = run_dict isa NamedTuple ? getproperty(run_dict, r_key) : run_dict[r_key]
         traj = hasproperty(raw_val, :trajectories) ? raw_val.trajectories : raw_val
-        s_sym = Symbol(s_key)
-        c = get(colors, s_sym, :dodgerblue)
+        c = palette[mod1(r_idx, length(palette))]
 
         ax = Axis(
             fig[row, col],
-            title = "$(string(s_key))",
+            title = "$(string(r_key))",
             xlabel = "Longitude (°E)",
             ylabel = "Latitude (°N)"
         )

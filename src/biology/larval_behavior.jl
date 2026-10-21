@@ -1554,8 +1554,12 @@ function track_larval_cohort(
     rng::AbstractRNG = Random.default_rng()
 )
     n_particles = length(larvae.lon)
-    n_steps = Int(floor(total_duration / dt)) + 1
-    times = range(0.0, total_duration, length = n_steps)
+    n_steps = max(1, Int(floor(total_duration / dt)) + 1)
+    # A record shorter than one time step is a record with ONE step in it, and
+    # `range(0.0, t, length = 1)` is an error in Julia whenever the endpoints differ: one
+    # point cannot sit at both of them. The step is still taken, and the label is the start
+    # of the record.
+    times = n_steps == 1 ? [0.0] : collect(range(0.0, total_duration; length = n_steps))
     dt_days = dt / 86400.0
 
     traj_lon = Matrix{Float64}(undef, n_particles, n_steps)
@@ -2186,8 +2190,8 @@ canonicalize_status!(trajectories::NamedTuple) = canonicalize_trajectories(traje
 # Species-level responses to ambient temperature: temperature-dependent
 # pelagic larval duration and instantaneous thermal mortality. These live with
 # the rest of the larval behaviour model because they are stage biology, not
-# climate forcing; `climate_scenarios.jl` supplies the temperature field that
-# they respond to.
+# climate forcing: the temperature field they respond to comes from the
+# ocean half's store, and the run's own heat budget.
 # ==========================================================================
 
 """
