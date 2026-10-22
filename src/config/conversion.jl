@@ -18,6 +18,50 @@ directory writes to the same place.
 """
 const _PROJECT_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 
+"""
+    _reject_legacy_keys(config_dict, section::AbstractString, pairs::Pair{String, String}...)
+
+Fail on a configuration key that has been renamed, naming the replacement.
+
+A renamed key is not a missing key. If the old name is simply absent, the conversion
+falls back to its default and the run proceeds with a parameter the file does not
+mention -- a model the configuration does not describe, and a silent one. The renamed
+parameters here carried DIFFERENT NUMBERS as well as different names, so a file written
+against them is not a file that can be read with new names substituted: the numbers in
+it are the old, wrong ones. Erroring is the only honest reading.
+"""
+function _reject_legacy_keys(config_dict::AbstractDict, section::AbstractString,
+                             pairs::Pair{String, String}...)
+    for (old, new) in pairs
+        if haskey(config_dict, section) && haskey(config_dict[section], old)
+            error(
+                "The configuration key '$old' in [$section] has been renamed to '$new'. " *
+                "The two carried different values as well as different names, so the " *
+                "file has to be updated rather than translated: '$old' is no longer read."
+            )
+        end
+    end
+    return nothing
+end
+
+"""
+    _stage_vector(value, n::Int, name::AbstractString) -> NTuple
+
+A per-stage parameter read from the configuration, as a tuple of `n` floats.
+
+A stage-indexed parameter is a list, and a list of the wrong length is a model the
+configuration does not describe. The error names the parameter and the length it
+expects, because the length is the thing that is nearly always wrong.
+"""
+function _stage_vector(value, n::Int, name::AbstractString)
+    v = collect(Float64.(value))
+    length(v) == n || error(
+        "The configuration key '$name' must have $n entries, got $(length(v)) " *
+        "($(v))."
+    )
+    return Tuple(v)
+end
+
 
 """
     configuration_to_options(config_dict::AbstractDict; config_name = "", overrides...) -> HydrodynamicOptions
@@ -155,15 +199,34 @@ function configuration_to_options(config_dict::AbstractDict;
     # mortality and settlement envelopes. A cohort that molts at 65 °C·d in one run and
     # 150 °C·d in the next is a different model, and the difference has to be in the
     # configuration file for anyone to see it.
-    t_base                   = Float64(get_val("molting_and_settlement", "t_base", -1.5))
-    dd_zoea1_to_zoea2        = Float64(get_val("molting_and_settlement", "dd_zoea1_to_zoea2", 65.0))
-    dd_zoea2_to_megalopa     = Float64(get_val("molting_and_settlement", "dd_zoea2_to_megalopa", 130.0))
-    dd_megalopa_to_settle    = Float64(get_val("molting_and_settlement", "dd_megalopa_to_settle", 200.0))
-    mortality_base           = Float64(get_val("molting_and_settlement", "mortality_base", 0.02))
-    mortality_thermal_threshold = Float64(get_val("molting_and_settlement", "mortality_thermal_threshold", 7.0))
-    mortality_thermal_sensitivity = Float64(get_val("molting_and_settlement", "mortality_thermal_sensitivity", 0.015))
-    mortality_cold_threshold = Float64(get_val("molting_and_settlement", "mortality_cold_threshold", -1.5))
-    mortality_cold_sensitivity = Float64(get_val("molting_and_settlement", "mortality_cold_sensitivity", 0.01))
+    #
+    # The parameter names are the sibling IBM's (GeoIBM's), because the two packages
+    # model the same animal and a name that means one thing in one and another thing in
+    # the other is a trap. A configuration written against the old names is REJECTED
+    # rather than ignored: the old names carried different numbers, and silently
+    # falling back to the defaults would run a model the file does not describe.
+    _reject_legacy_keys(config_dict, "molting_and_settlement",
+        "t_base" => "temp_base_degreedays",
+        "dd_zoea1_to_zoea2" => "degree_days_larval",
+        "dd_zoea2_to_megalopa" => "degree_days_larval",
+        "dd_megalopa_to_settle" => "degree_days_larval",
+        "mortality_base" => "larval_baseline_hazards",
+        "mortality_thermal_threshold" => "larval_temp_opt",
+        "mortality_thermal_sensitivity" => "larval_temp_sigma",
+        "mortality_cold_threshold" => "larval_temp_opt",
+        "mortality_cold_sensitivity" => "larval_temp_sigma")
+
+    temp_base_degreedays     = Float64(get_val("molting_and_settlement", "temp_base_degreedays", -1.5))
+    degree_days_larval       = _stage_vector(get_val("molting_and_settlement", "degree_days_larval",
+                                                      [0.0, 270.0, 270.0, 270.0]), 4, "degree_days_larval")
+    intermolt_days_larval    = _stage_vector(get_val("molting_and_settlement", "intermolt_days_larval",
+                                                      [0.0, 36.0, 36.0, 42.0]), 4, "intermolt_days_larval")
+    larval_baseline_hazards  = _stage_vector(get_val("molting_and_settlement", "larval_baseline_hazards",
+                                                      [0.020, 0.020, 0.015]), 3, "larval_baseline_hazards")
+    larval_temp_opt          = Float64(get_val("molting_and_settlement", "larval_temp_opt", 11.0))
+    larval_temp_sigma        = Float64(get_val("molting_and_settlement", "larval_temp_sigma", 3.5))
+    larval_overage_hazard    = Float64(get_val("molting_and_settlement", "larval_overage_hazard", 0.05))
+    larval_max_intermolt_days = Float64(get_val("molting_and_settlement", "larval_max_intermolt_days", 84.0))
     settlement_min_depth     = Float64(get_val("molting_and_settlement", "settlement_min_depth", -250.0))
     settlement_max_depth     = Float64(get_val("molting_and_settlement", "settlement_max_depth", -50.0))
     settlement_max_temp      = Float64(get_val("molting_and_settlement", "settlement_max_temp", 6.0))
@@ -378,15 +441,14 @@ function configuration_to_options(config_dict::AbstractDict;
         megalopa_night_depth = megalopa_night_depth,
         zoea2_depth_factor = zoea2_depth_factor,
         megalopa_swim_factor = megalopa_swim_factor,
-        t_base = t_base,
-        dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
-        dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
-        dd_megalopa_to_settle = dd_megalopa_to_settle,
-        mortality_base = mortality_base,
-        mortality_thermal_threshold = mortality_thermal_threshold,
-        mortality_thermal_sensitivity = mortality_thermal_sensitivity,
-        mortality_cold_threshold = mortality_cold_threshold,
-        mortality_cold_sensitivity = mortality_cold_sensitivity,
+        temp_base_degreedays = temp_base_degreedays,
+        degree_days_larval = degree_days_larval,
+        intermolt_days_larval = intermolt_days_larval,
+        larval_baseline_hazards = larval_baseline_hazards,
+        larval_temp_opt = larval_temp_opt,
+        larval_temp_sigma = larval_temp_sigma,
+        larval_overage_hazard = larval_overage_hazard,
+        larval_max_intermolt_days = larval_max_intermolt_days,
         settlement_min_depth = settlement_min_depth,
         settlement_max_depth = settlement_max_depth,
         settlement_max_temp = settlement_max_temp,
@@ -546,6 +608,21 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "molting_and_settlement" => Dict{String, Any}(
             "enable_molting" => opts.enable_molting,
+            # The phenology and the mortality envelope belong in the resolved
+            # configuration. They were not written back before, so a resolved config did
+            # not record the model that ran: the thresholds and the mortality were in the
+            # file only if the operator had put them there by hand.
+            "temp_base_degreedays" => opts.temp_base_degreedays,
+            "degree_days_larval" => collect(opts.degree_days_larval),
+            "intermolt_days_larval" => collect(opts.intermolt_days_larval),
+            "larval_baseline_hazards" => collect(opts.larval_baseline_hazards),
+            "larval_temp_opt" => opts.larval_temp_opt,
+            "larval_temp_sigma" => opts.larval_temp_sigma,
+            "larval_overage_hazard" => opts.larval_overage_hazard,
+            "larval_max_intermolt_days" => opts.larval_max_intermolt_days,
+            "settlement_min_depth" => opts.settlement_min_depth,
+            "settlement_max_depth" => opts.settlement_max_depth,
+            "settlement_max_temp" => opts.settlement_max_temp,
             "cv_molt" => opts.cv_molt,
             "cv_mortality" => opts.cv_mortality
         ),
@@ -700,15 +777,14 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         :zoea2_depth_factor       => opts.zoea2_depth_factor,
         :megalopa_swim_factor     => opts.megalopa_swim_factor,
         :enable_molting           => opts.enable_molting,
-        :t_base                   => opts.t_base,
-        :dd_zoea1_to_zoea2        => opts.dd_zoea1_to_zoea2,
-        :dd_zoea2_to_megalopa     => opts.dd_zoea2_to_megalopa,
-        :dd_megalopa_to_settle    => opts.dd_megalopa_to_settle,
-        :mortality_base           => opts.mortality_base,
-        :mortality_thermal_thresh => opts.mortality_thermal_threshold,
-        :mortality_thermal_sens   => opts.mortality_thermal_sensitivity,
-        :mortality_cold_thresh    => opts.mortality_cold_threshold,
-        :mortality_cold_sens      => opts.mortality_cold_sensitivity,
+        :temp_base_degreedays     => opts.temp_base_degreedays,
+        :degree_days_larval       => collect(opts.degree_days_larval),
+        :intermolt_days_larval    => collect(opts.intermolt_days_larval),
+        :larval_baseline_hazards  => collect(opts.larval_baseline_hazards),
+        :larval_temp_opt          => opts.larval_temp_opt,
+        :larval_temp_sigma        => opts.larval_temp_sigma,
+        :larval_overage_hazard    => opts.larval_overage_hazard,
+        :larval_max_intermolt_days => opts.larval_max_intermolt_days,
         :settlement_min_depth     => opts.settlement_min_depth,
         :settlement_max_depth     => opts.settlement_max_depth,
         :settlement_max_temp      => opts.settlement_max_temp,
@@ -740,11 +816,12 @@ function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersal
         Float64(d[:zoea2_day_depth]), Float64(d[:zoea2_night_depth]),
         Float64(d[:megalopa_day_depth]), Float64(d[:megalopa_night_depth]),
         Float64(d[:zoea2_depth_factor]), Float64(d[:megalopa_swim_factor]),
-        Bool(d[:enable_molting]), Float64(d[:t_base]),
-        Float64(d[:dd_zoea1_to_zoea2]), Float64(d[:dd_zoea2_to_megalopa]),
-        Float64(d[:dd_megalopa_to_settle]), Float64(d[:mortality_base]),
-        Float64(d[:mortality_thermal_thresh]), Float64(d[:mortality_thermal_sens]),
-        Float64(d[:mortality_cold_thresh]), Float64(d[:mortality_cold_sens]),
+        Bool(d[:enable_molting]), Float64(d[:temp_base_degreedays]),
+        _stage_vector(d[:degree_days_larval], 4, "degree_days_larval"),
+        _stage_vector(d[:intermolt_days_larval], 4, "intermolt_days_larval"),
+        _stage_vector(d[:larval_baseline_hazards], 3, "larval_baseline_hazards"),
+        Float64(d[:larval_temp_opt]), Float64(d[:larval_temp_sigma]),
+        Float64(d[:larval_overage_hazard]), Float64(d[:larval_max_intermolt_days]),
         Float64(d[:settlement_min_depth]), Float64(d[:settlement_max_depth]),
         Float64(d[:settlement_max_temp]), Bool(d[:settlement_stochastic]),
          Float64(d[:cv_molt]), Float64(d[:cv_mortality]), Float64(d[:cv_settlement]),

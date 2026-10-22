@@ -114,15 +114,14 @@ struct HydrodynamicOptions
     megalopa_night_depth     :: Float64
     zoea2_depth_factor       :: Float64
     megalopa_swim_factor     :: Float64
-    t_base                   :: Float64
-    dd_zoea1_to_zoea2        :: Float64
-    dd_zoea2_to_megalopa     :: Float64
-    dd_megalopa_to_settle    :: Float64
-    mortality_base           :: Float64
-    mortality_thermal_threshold :: Float64
-    mortality_thermal_sensitivity :: Float64
-    mortality_cold_threshold :: Float64
-    mortality_cold_sensitivity :: Float64
+    temp_base_degreedays     :: Float64
+    degree_days_larval       :: Tuple{Float64, Float64, Float64, Float64}
+    intermolt_days_larval    :: Tuple{Float64, Float64, Float64, Float64}
+    larval_baseline_hazards  :: Tuple{Float64, Float64, Float64}
+    larval_temp_opt          :: Float64
+    larval_temp_sigma         :: Float64
+    larval_overage_hazard     :: Float64
+    larval_max_intermolt_days :: Float64
     settlement_min_depth     :: Float64
     settlement_max_depth     :: Float64
     settlement_max_temp      :: Float64
@@ -301,15 +300,14 @@ function HydrodynamicOptions(;
     megalopa_night_depth  :: Real = -60.0,
     zoea2_depth_factor    :: Real = 1.2,
     megalopa_swim_factor  :: Real = 1.5,
-    t_base                :: Real = -1.5,
-    dd_zoea1_to_zoea2     :: Real = 65.0,
-    dd_zoea2_to_megalopa  :: Real = 130.0,
-    dd_megalopa_to_settle :: Real = 200.0,
-    mortality_base        :: Real = 0.02,
-    mortality_thermal_threshold :: Real = 7.0,
-    mortality_thermal_sensitivity :: Real = 0.015,
-    mortality_cold_threshold :: Real = -1.5,
-    mortality_cold_sensitivity :: Real = 0.01,
+    temp_base_degreedays     :: Real = -1.5,
+    degree_days_larval       :: Tuple{Real, Real, Real, Real} = (0.0, 270.0, 270.0, 270.0),
+    intermolt_days_larval    :: Tuple{Real, Real, Real, Real} = (0.0, 36.0, 36.0, 42.0),
+    larval_baseline_hazards  :: Tuple{Real, Real, Real} = (0.020, 0.020, 0.015),
+    larval_temp_opt          :: Real = 11.0,
+    larval_temp_sigma         :: Real = 3.5,
+    larval_overage_hazard     :: Real = 0.05,
+    larval_max_intermolt_days :: Real = 84.0,
     settlement_min_depth  :: Real = -250.0,
     settlement_max_depth  :: Real = -50.0,
     settlement_max_temp   :: Real = 6.0,
@@ -424,15 +422,14 @@ function HydrodynamicOptions(;
         Float64(megalopa_night_depth),
         Float64(zoea2_depth_factor),
         Float64(megalopa_swim_factor),
-        Float64(t_base),
-        Float64(dd_zoea1_to_zoea2),
-        Float64(dd_zoea2_to_megalopa),
-        Float64(dd_megalopa_to_settle),
-        Float64(mortality_base),
-        Float64(mortality_thermal_threshold),
-        Float64(mortality_thermal_sensitivity),
-        Float64(mortality_cold_threshold),
-        Float64(mortality_cold_sensitivity),
+        Float64(temp_base_degreedays),
+        Tuple(Float64.(degree_days_larval)),
+        Tuple(Float64.(intermolt_days_larval)),
+        Tuple(Float64.(larval_baseline_hazards)),
+        Float64(larval_temp_opt),
+        Float64(larval_temp_sigma),
+        Float64(larval_overage_hazard),
+        Float64(larval_max_intermolt_days),
         Float64(settlement_min_depth),
         Float64(settlement_max_depth),
         Float64(settlement_max_temp),
@@ -585,15 +582,14 @@ struct LarvalDispersalConfig
     zoea2_depth_factor       :: Float64
     megalopa_swim_factor     :: Float64
     enable_molting           :: Bool
-    t_base                   :: Float64
-    dd_zoea1_to_zoea2        :: Float64
-    dd_zoea2_to_megalopa     :: Float64
-    dd_megalopa_to_settle    :: Float64
-    mortality_base           :: Float64
-    mortality_thermal_thresh :: Float64
-    mortality_thermal_sens   :: Float64
-    mortality_cold_thresh    :: Float64
-    mortality_cold_sens      :: Float64
+    temp_base_degreedays     :: Float64
+    degree_days_larval       :: Tuple{Float64, Float64, Float64, Float64}
+    intermolt_days_larval    :: Tuple{Float64, Float64, Float64, Float64}
+    larval_baseline_hazards  :: Tuple{Float64, Float64, Float64}
+    larval_temp_opt          :: Float64
+    larval_temp_sigma        :: Float64
+    larval_overage_hazard    :: Float64
+    larval_max_intermolt_days :: Float64
     settlement_min_depth     :: Float64
     settlement_max_depth     :: Float64
     settlement_max_temp      :: Float64

@@ -88,20 +88,25 @@ zoea2_depth_factor = 1.0      # Depth scaling multiplier for Zoea II
 megalopa_swim_factor = 1.0    # Swimming speed multiplier for Megalopa
 
 [molting_and_settlement]
-# Degree-day phenology and benthic nursery settlement criteria
+# Degree-day phenology and benthic nursery settlement criteria.
+#
+# The parameter names are the sibling IBM's (GeoIBM's); the stage index is GeoIBM's
+# too: 0 is the egg, 1 zoea I, 2 zoea II, 3 the megalopa.
 enable_molting = true         # Track degree-day accumulation and ecdysis
-t_base = -1.5                 # Physiological base temperature for degree-days (°C)
-dd_zoea1_to_zoea2 = 65.0      # Cumulative degree-days to molt from Zoea I to Zoea II
-dd_zoea2_to_megalopa = 130.0  # Cumulative degree-days to molt from Zoea II to Megalopa
-dd_megalopa_to_settle = 200.0 # Cumulative degree-days for Megalopa to reach competence
+temp_base_degreedays = -1.5   # Physiological base temperature for degree-days (°C)
+degree_days_larval = [0.0, 270.0, 270.0, 270.0]
+                              # Per-stage degree-days to molt, reset at each ecdysis
+intermolt_days_larval = [0.0, 36.0, 36.0, 42.0]
+                              # Per-stage minimum duration (days): the calendar gate
+larval_baseline_hazards = [0.010, 0.010, 0.0075]
+                              # Baseline daily mortality (day^-1): zoea I, zoea II, megalopa
+larval_temp_opt = 11.0        # The pelagic survival optimum (°C)
+larval_temp_sigma = 3.5       # The width of that optimum (°C)
+larval_overage_hazard = 0.05  # Daily penalty per 10 days beyond the viable stage duration
+larval_max_intermolt_days = 84.0  # The maximum viable duration of a pelagic stage (days)
 settlement_min_depth = -500.0 # Deep bathymetric boundary for benthic settlement (m)
 settlement_max_depth = -10.0  # Shallow bathymetric boundary for benthic settlement (m)
 settlement_max_temp = 7.0     # Thermal ceiling for viable benthic settlement (°C)
-mortality_base = 0.01         # Baseline daily mortality hazard rate (day^-1) .. ie, 0.365 /yr
-mortality_thermal_threshold = 15.0 # Thermal stress threshold temperature (°C)
-mortality_thermal_sensitivity = 0.02 # Incremental mortality per °C above threshold
-mortality_cold_threshold = 0.0 # Cold stress threshold temperature (°C)
-mortality_cold_sensitivity = 0.01 # Incremental mortality per °C below cold threshold
 
 [visualization]
 # Diagnostics, animations, and interactive mapping

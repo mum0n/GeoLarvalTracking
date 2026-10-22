@@ -214,13 +214,18 @@ function get_default_configuration()::Dict{String, Any}
         ),
         "molting_and_settlement" => Dict{String, Any}(
             "enable_molting" => true,
-            "t_base" => 0.0,
-            "dd_zoea1_to_zoea2" => 150.0,
-            "dd_zoea2_to_megalopa" => 310.0,
-            "dd_megalopa_to_settle" => 510.0,
-            "mortality_base" => 0.02,
-            "mortality_thermal_threshold" => 10.0,
-            "mortality_thermal_sensitivity" => 0.015,
+            # The sibling IBM's (GeoIBM's) parameter names, because the two packages
+            # model the same animal. The stage index is GeoIBM's: 0 is the egg, 1 zoea I,
+            # 2 zoea II, 3 the megalopa; the egg is never used here but is kept so the
+            # two packages' vectors can be compared entry by entry.
+            "temp_base_degreedays" => -1.5,
+            "degree_days_larval" => [0.0, 270.0, 270.0, 270.0],
+            "intermolt_days_larval" => [0.0, 36.0, 36.0, 42.0],
+            "larval_baseline_hazards" => [0.020, 0.020, 0.015],
+            "larval_temp_opt" => 11.0,
+            "larval_temp_sigma" => 3.5,
+            "larval_overage_hazard" => 0.05,
+            "larval_max_intermolt_days" => 84.0,
             "settlement_min_depth" => -250.0,
             "settlement_max_depth" => -50.0,
             "settlement_max_temp" => 6.0

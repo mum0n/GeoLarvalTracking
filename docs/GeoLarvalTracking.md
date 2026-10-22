@@ -383,14 +383,22 @@ megalopa_night_depth = -60.0        # Megalopa nighttime target depth (meters)
 turbidity_attenuation = 1.0         # Turbidity vertical migration attenuation factor
 
 [molting_and_settlement]
+# The parameter names are the sibling IBM's (GeoIBM's), because the two packages model
+# the same animal. The stage index is GeoIBM's too: 0 is the egg, 1 zoea I, 2 zoea II,
+# 3 the megalopa. The egg is never used here, but it is kept in the vectors so the two
+# packages' parameters can be compared entry by entry.
 enable_molting = true               # Degree-day molting and thermal mortality
-t_base = -1.5                       # Base physiological development temperature (°C)
-dd_zoea1_to_zoea2 = 65.0            # Zoea I -> Zoea II molt threshold (DD)
-dd_zoea2_to_megalopa = 130.0        # Zoea II -> Megalopa molt threshold (DD)
-dd_megalopa_to_settle = 200.0       # Megalopa settlement competency threshold (DD)
-mortality_base = 0.02               # Natural baseline mortality (day^-1)
-mortality_thermal_threshold = 7.0   # Thermal stress threshold (°C)
-mortality_thermal_sensitivity = 0.015 # Excess thermal mortality rate
+temp_base_degreedays = -1.5         # Development base temperature (°C)
+degree_days_larval = [0.0, 270.0, 270.0, 270.0]
+                                    # Per-stage degree-day requirement (°C·d), reset at each ecdysis
+intermolt_days_larval = [0.0, 36.0, 36.0, 42.0]
+                                    # Per-stage minimum duration (days): the calendar gate
+larval_baseline_hazards = [0.020, 0.020, 0.015]
+                                    # Baseline daily mortality (day^-1): zoea I, zoea II, megalopa
+larval_temp_opt = 11.0              # The pelagic survival optimum (°C)
+larval_temp_sigma = 3.5             # The width of that optimum (°C)
+larval_overage_hazard = 0.05        # Daily penalty per 10 days beyond the viable stage duration
+larval_max_intermolt_days = 84.0    # The maximum viable duration of a pelagic stage (days)
 settlement_min_depth = -250.0       # Nursery maximum depth limit (meters)
 settlement_max_depth = -50.0        # Nursery minimum depth limit (meters)
 settlement_max_temp = 6.0           # Maximum benthic temperature for settlement (°C)

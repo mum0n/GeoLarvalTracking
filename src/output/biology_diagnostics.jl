@@ -6,10 +6,10 @@ Cohort-level diagnostics for the larval biology that the main figure set did not
 The particle-tracking model computes several quantities that were previously only embedded in the
 interactive HTML payload and never drawn as a figure, which made the stage model hard to check:
 
-- `cohort_molt_fraction` — the CDF-based probability that a cohort has completed each transition,
-  on the same 0-to-1 scale as the per-larva developmental quantiles;
-- `degree_days_timeseries` — the cumulative thermal time each larva actually accumulated, which is
-  the x-axis on which every stage transition is defined;
+- `cohort_molt_fraction` — the fraction of the cohort that has completed each transition, on the
+  same 0-to-1 scale as the per-larva developmental quantiles;
+- `degree_days_timeseries` — the thermal time each larva accumulated within its current stage,
+  which is the x-axis on which every stage transition is defined;
 - `temperatures` — the temperature history the larvae were advected through;
 - `survival_probability` and `stage_survival` — cohort survival and the fraction alive at each
   stage transition;
@@ -37,15 +37,18 @@ Diagnostic for the quantile/CDF stage model: how the cohort advances through Zoe
 Megalopa -> Instar I over the simulated period.
 
 # Panels
-1. **Cohort transition probability** — `cohort_molt_fraction` against time, one curve per
-   transition, on a 0-to-1 axis. This is the direct readout of the CDF the per-larva quantiles are
-   compared against.
+1. **Cohort transition fractions** — `cohort_molt_fraction` against time, one curve per
+   transition, on a 0-to-1 axis. This is the fraction of the cohort that has COMPLETED each
+   transition, read from the stage each larva reached.
 2. **Realised stage composition** — the fraction of the cohort in each stage over time, as stacked
-   bands. Should track panel 1: a cohort fraction that has completed a transition should match the
-   fraction of larvae at or beyond that stage.
+   bands. Panel 1 is the running count of the same thing: a cohort fraction that has completed a
+   transition matches the fraction of larvae at or beyond that stage.
 3. **Developmental quantile spread** — molting degree-day against developmental quantile `u` for a
-   sample of particles, with the resolved schedule's median and base threshold marked. Confirms the
+   sample of particles, with the resolved schedule's mean thresholds marked. Confirms the
    ordering (small `u` moults early) and the shape of the distribution.
+
+The thresholds marked in panel 3 are read from the run's own resolved schedule, so the figure
+describes the model that ran rather than a set of numbers written into the plotting code.
 
 # Inputs
 - `trajs`: Trajectory NamedTuple from `track_larval_cohort`.
@@ -54,7 +57,7 @@ Megalopa -> Instar I over the simulated period.
 function plot_molt_progression(
     trajs::NamedTuple;
     output_path::Union{Nothing, AbstractString} = "outputs/mole_progression.png",
-    title::AbstractString = "Stage Progression: Cohort CDF and Realised Composition",
+    title::AbstractString = "Stage Progression: Cohort Fractions and Realised Composition",
     n_sample::Int = 120
 )
     times = [t / 86400.0 for t in trajs.times]
@@ -64,8 +67,8 @@ function plot_molt_progression(
     fig = Figure(size = (1400, 450), fontsize = 12)
     labels = ["Zoea I → Zoea II", "Zoea II → Megalopa", "Megalopa → Instar I"]
 
-    # Panel 1: cohort transition probability from the CDF
-    ax1 = Axis(fig[1, 1], title = "Cohort transition probability (CDF)",
+    # Panel 1: the fraction of the cohort that has completed each transition
+    ax1 = Axis(fig[1, 1], title = "Cohort transition fraction (completed)",
                xlabel = "Time (days)", ylabel = "Fraction of cohort completed",
                limits = (0, isempty(times) ? 1 : times[end], 0, 1))
     for k in 1:3
@@ -92,8 +95,11 @@ function plot_molt_progression(
     # Panel 3: molting degree-day against developmental quantile
     has_sched = hasproperty(trajs, :molt_schedule) && trajs.molt_schedule !== nothing &&
                 length(trajs.molt_schedule) == 3
+    thrs = has_sched ? molt_mean_thresholds(trajs.molt_schedule) :
+           molt_mean_thresholds(molt_schedule())
+    thr_label = join([string(round(t, digits = 1)) for t in thrs], " / ")
     ax3 = Axis(fig[1, 5],
-               title = has_sched ? "Molt threshold vs quantile (dashed: base 65/130/200)" :
+               title = has_sched ? "Molt threshold vs quantile (dashed: mean $thr_label °C·d)" :
                                    "Molt threshold vs quantile (no schedule recorded)",
                xlabel = "Developmental quantile u", ylabel = "Molt degree-day")
     if has_sched
@@ -103,7 +109,7 @@ function plot_molt_progression(
             lines!(ax3, us, [threshold(sched[k], u) for u in us],
                    color = _STAGE_COLORS[k], linewidth = 2, label = labels[k])
         end
-        for thr in (65.0, 130.0, 200.0)
+        for thr in thrs
             hlines!(ax3, [thr], color = (:grey, 0.5), linestyle = :dash)
         end
         Legend(fig[1, 6], ax3; position = :rt)
@@ -116,13 +122,15 @@ end
 """
     plot_degree_day_growth(trajs; output_path, title)
 
-Cumulative thermal degree-day actually accumulated by each larva, against time, with the three
-base thresholds marked.
+Thermal degree-days accumulated by each larva, against time, with the stage thresholds marked.
 
 This is the x-axis of the whole stage model — every transition is defined on it — so a run whose
 curves stay flat has larvae that never develop, and one whose curves diverge is doing so because
-larvae saw different temperatures. A 20-day cohort should reach ~65 DD and molt; a 730-day one
-saturates the first two thresholds and is limited by the third.
+larvae saw different temperatures.
+
+The accumulation is PER STAGE and resets at each ecdysis, so a curve that reaches a threshold and
+drops back to zero is a larva that has MOULTED, not one that lost its thermal history. The
+thresholds marked are read from the run's own resolved schedule.
 
 # Inputs
 - `trajs`: Trajectory NamedTuple.
@@ -131,7 +139,7 @@ saturates the first two thresholds and is limited by the third.
 function plot_degree_day_growth(
     trajs::NamedTuple;
     output_path::Union{Nothing, AbstractString} = "outputs/degree_day_growth.png",
-    title::AbstractString = "Cumulative Degree-Day Accumulation",
+    title::AbstractString = "Degree-Day Accumulation Within Stage",
     n_sample::Int = 200
 )
     times = [t / 86400.0 for t in trajs.times]
@@ -139,14 +147,20 @@ function plot_degree_day_growth(
     n_p = size(dds, 1)
     fig = Figure(size = (1200, 500), fontsize = 12)
 
+    has_sched = hasproperty(trajs, :molt_schedule) && trajs.molt_schedule !== nothing &&
+                length(trajs.molt_schedule) == 3
+    thrs = has_sched ? molt_mean_thresholds(trajs.molt_schedule) :
+           molt_mean_thresholds(molt_schedule())
+    thr_label = join([string(round(t, digits = 1)) for t in thrs], " / ")
+
     ax1 = Axis(fig[1, 1],
-               title = "Cumulative degree-day, cohort mean (dashed: 65 / 130 / 200 DD)",
-               xlabel = "Time (days)", ylabel = "Cumulative degree-day (°C·d)")
+               title = "Degree-day within stage, cohort mean (dashed: $thr_label °C·d)",
+               xlabel = "Time (days)", ylabel = "Degree-day (°C·d)")
     idx = unique(round.(Int, range(1, n_p, length = min(n_sample, n_p))))
     for p in idx
         lines!(ax1, times, @view(dds[p, :]), color = (:steelblue, 0.25), linewidth = 0.8)
     end
-    for (thr, lab) in ((65.0, "Z I→II"), (130.0, "II→M"), (200.0, "M→I"))
+    for (thr, lab) in zip(thrs, ("Z I→II", "II→M", "M→I"))
         hlines!(ax1, [thr], color = (:crimson, 0.55), linestyle = :dash, label = lab)
     end
     lines!(ax1, times, [mean(@view dds[:, j]) for j in axes(dds, 2)],
@@ -164,11 +178,11 @@ function plot_degree_day_growth(
            color = :black, linewidth = 3)
 
     # Panel 3: distribution of final accumulated degree-days
-    ax3 = Axis(fig[1, 3], title = "Final degree-day per larva",
-               xlabel = "Cumulative degree-day (°C·d)", ylabel = "Larvae")
+    ax3 = Axis(fig[1, 3], title = "Final within-stage degree-day per larva",
+               xlabel = "Degree-day (°C·d)", ylabel = "Larvae")
     final_dd = [dds[p, end] for p in 1:n_p]
     hist!(ax3, final_dd; bins = min(40, max(10, n_p ÷ 4)), color = :steelblue)
-    for thr in (65.0, 130.0, 200.0)
+    for thr in thrs
         vlines!(ax3, [thr], color = (:crimson, 0.5), linestyle = :dash)
     end
 

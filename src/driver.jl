@@ -342,15 +342,14 @@ function run_segment_tracking(; opts::HydrodynamicOptions = HydrodynamicOptions(
         # The biology's parameters, forwarded from the configuration. The behaviour module
         # has its own defaults for all of these; forwarding them is what makes the
         # configuration file the record of the model that actually ran.
-        t_base = opts.t_base,
-        dd_zoea1_to_zoea2 = opts.dd_zoea1_to_zoea2,
-        dd_zoea2_to_megalopa = opts.dd_zoea2_to_megalopa,
-        dd_megalopa_to_settle = opts.dd_megalopa_to_settle,
-        mortality_base = opts.mortality_base,
-        mortality_thermal_threshold = opts.mortality_thermal_threshold,
-        mortality_thermal_sensitivity = opts.mortality_thermal_sensitivity,
-        mortality_cold_threshold = opts.mortality_cold_threshold,
-        mortality_cold_sensitivity = opts.mortality_cold_sensitivity,
+        temp_base_degreedays = opts.temp_base_degreedays,
+        degree_days_larval = opts.degree_days_larval,
+        intermolt_days_larval = opts.intermolt_days_larval,
+        larval_baseline_hazards = opts.larval_baseline_hazards,
+        larval_temp_opt = opts.larval_temp_opt,
+        larval_temp_sigma = opts.larval_temp_sigma,
+        larval_overage_hazard = opts.larval_overage_hazard,
+        larval_max_intermolt_days = opts.larval_max_intermolt_days,
         settlement_min_depth = opts.settlement_min_depth,
         settlement_max_depth = opts.settlement_max_depth,
         settlement_max_temp = opts.settlement_max_temp,
@@ -692,16 +691,27 @@ end
 Add `molt_schedule` and `cohort_molt_fraction` to a trajectory set that lacks them, such as one
 read back from Zarr/GeoData storage, which stores per-particle rows only.
 
-Both are deterministic functions of the run configuration and the stored degree-days, so they
+Both are deterministic functions of the run configuration and the stored trajectory, so they
 are recomputed rather than approximated:
 
-- `molt_schedule = molt_schedule(cv_molt = opts.cv_molt)`. Segment 6 calls
-  `track_larval_cohort` without degree-day thresholds, so the run used the shared defaults
-  (65, 130, 200 °C·d); if Segment 6 starts passing thresholds, pass them here too.
-- `cohort_molt_fraction[:, j] = cohort_molt_fraction(schedule, D̄_j)` with
-  ``\\bar D_j = N_p^{-1} \\sum_p D_{p,j}``, the cohort-mean degree-day at step `j`. This is the
-  formula `track_larval_cohort` applies, and `degree_days_timeseries[:, j]` holds the same
-  per-larva values it averages (dead larvae carry their last value).
+- `molt_schedule = molt_schedule(degree_days_larval = opts.degree_days_larval,
+  cv_molt = opts.cv_molt)`. The schedule is rebuilt from the CONFIGURED thresholds, so
+  the diagnostic agrees with the run it is diagnosing. It used to be rebuilt with the
+  package's defaults, which made the figure a picture of a different model whenever the
+  configuration said anything else -- and the configuration is where the model's
+  parameters live, so it nearly always says something else.
+- `cohort_molt_fraction[:, j]` is the fraction of the cohort that has completed each
+  transition at step `j`, computed from the stored stage history. It used to be computed
+  from the cohort-MEAN degree-day, which was meaningful when the thresholds were
+  cumulative and every larva's accumulation counted from the same origin. They are now
+  accumulated PER STAGE and reset at each ecdysis, so the cohort mean is an average over
+  larvae in different stages -- each counting from its own last ecdysis -- and reading
+  the threshold CDF at that mean says more about the stage mix than about the cohort's
+  development. With the three per-stage thresholds equal, it also saturates the second
+  and third transitions while every larva is still in the first.
+
+The stage history is the source of truth for this quantity, and it carries the dead
+larvae's stages forward: a larva recorded as `:dead` is counted at the stage it reached.
 
 Fields already present are left unchanged. When molting is disabled the run recorded no
 schedule, so nothing is added and the figure reports it as not recorded.
@@ -710,17 +720,13 @@ function _complete_stage_diagnostics(trajs::NamedTuple, opts)
     has(k) = hasproperty(trajs, k) && !isnothing(getproperty(trajs, k))
     opts.enable_molting || return trajs
 
-    sched = has(:molt_schedule) ? trajs.molt_schedule : molt_schedule(cv_molt = opts.cv_molt)
+    sched = has(:molt_schedule) ? trajs.molt_schedule :
+             molt_schedule(degree_days_larval = opts.degree_days_larval, cv_molt = opts.cv_molt)
     extra = has(:molt_schedule) ? NamedTuple() : (molt_schedule = sched,)
 
     if !has(:cohort_molt_fraction)
-        dds = trajs.degree_days_timeseries
-        n_p, n_t = size(dds)
-        cm = Matrix{Float64}(undef, 3, n_t)
-        for j in 1:n_t
-            cm[:, j] .= cohort_molt_fraction(sched, sum(view(dds, :, j)) / n_p)
-        end
-        extra = merge(extra, (cohort_molt_fraction = cm,))
+        stages = getproperty(trajs, :stages)
+        extra = merge(extra, (cohort_molt_fraction = cohort_transition_fraction_history(stages),))
     end
     return isempty(extra) ? trajs : merge(trajs, extra)
 end
@@ -904,50 +910,60 @@ function run_segment_visualize(;
     # 8. Hydrodynamic Model Eulerian Advection & Tracers Figures
     fig8_path = joinpath(opts.output_dir, "hydrodynamic_advection.png")
     fig9_path = joinpath(opts.output_dir, "hydrodynamic_tracers.png")
-    println("Rendering hydrodynamic advection velocity field -> $(fig8_path)...")
-    active_hydro = if opts.enable_zarr && isdir(opts.zarr_path)
+    fig_strat_path = joinpath(opts.output_dir, "hydrodynamic_stratification.png")
+    fig_diff_path = joinpath(opts.output_dir, "hydrodynamic_diffusion.png")
+    fig_sec_path = joinpath(opts.output_dir, "hydrodynamic_section.png")
+    fig_ts_path = nothing
+    fig_hov_path = nothing
+    fig_tbot_path = nothing
+    fig_ts_diagram_path = nothing
+
+    # The Eulerian figures are drawn from the REALIZED OCEAN STORE -- the same store the
+    # cohort tracked through -- and not from the larval Zarr store's `hydrodynamic_fields`
+    # group. That group is created empty by the schema and never written, so reading it
+    # returned an empty dataset: no depth axis, no speed, no time, and the first figure
+    # died on `depths[0]`. The ocean store is where the Eulerian fields actually are, and
+    # `extract_hydrodynamic_dataset` returns them in the shape these figures take.
+    hydro_location = resolve_hydro_model_path(opts, "hydrodynamics.zarr")[1]
+    active_hydro = if isdir(hydro_location)
         try
-            db_h = open_storage(opts.zarr_path; read_only = true)
-            try
-                target_run_id = run_identifier(opts)
-                load_hydrodynamic_field(db_h, target_run_id)
-            finally
-                close_storage(db_h)
-            end
-        catch
+            extract_hydrodynamic_dataset(hydro_location)
+        catch err
+            @warn "Could not read the hydrodynamic fields from $(hydro_location) " *
+                  "($(sprint(showerror, err))); the Eulerian figures are skipped."
             nothing
         end
     else
+        @warn "No realized ocean store at $(hydro_location); the Eulerian figures are skipped."
         nothing
     end
-    plot_hydrodynamic_advection(active_hydro, bathymetry_data = bathy_data, output_path = fig8_path)
 
-    println("Rendering hydrodynamic seawater temperature & salinity tracers -> $(fig9_path)...")
-    plot_hydrodynamic_tracers(active_hydro, output_path = fig9_path)
-
-    fig_strat_path = joinpath(opts.output_dir, "hydrodynamic_stratification.png")
-    println("Rendering hydrodynamic stratification diagnostics (N², S) -> $(fig_strat_path)...")
-    plot_hydrodynamic_stratification(active_hydro, output_path = fig_strat_path)
-
-    fig_diff_path = joinpath(opts.output_dir, "hydrodynamic_diffusion.png")
-    println("Rendering hydrodynamic turbulent diffusion & eddy viscosity -> $(fig_diff_path)...")
-    plot_hydrodynamic_diffusion(active_hydro, output_path = fig_diff_path)
-
-    fig_sec_path = joinpath(opts.output_dir, "hydrodynamic_section.png")
-    println("Rendering hydrodynamic vertical cross-section -> $(fig_sec_path)...")
-    plot_hydrodynamic_section(
-        active_hydro,
-        variable = :temperature,
-        coordinate = 44.0,
-        section_type = :lat,
-        output_path = fig_sec_path
-    )
-
-    # 8b. Eulerian time series at a representative station. This plot function existed but was
-    # never called by the driver, so no run ever produced an Eulerian time series — the standard
-    # check that a simulation is evolving plausibly at a fixed point.
-    fig_ts_path = joinpath(opts.output_dir, "hydrodynamic_timeseries.png")
     if !isnothing(active_hydro)
+        println("Rendering hydrodynamic advection velocity field -> $(fig8_path)...")
+        plot_hydrodynamic_advection(active_hydro, bathymetry_data = bathy_data, output_path = fig8_path)
+
+        println("Rendering hydrodynamic seawater temperature & salinity tracers -> $(fig9_path)...")
+        plot_hydrodynamic_tracers(active_hydro, output_path = fig9_path)
+
+        println("Rendering hydrodynamic stratification diagnostics (N², S) -> $(fig_strat_path)...")
+        plot_hydrodynamic_stratification(active_hydro, output_path = fig_strat_path)
+
+        println("Rendering hydrodynamic turbulent diffusion & eddy viscosity -> $(fig_diff_path)...")
+        plot_hydrodynamic_diffusion(active_hydro, output_path = fig_diff_path)
+
+        println("Rendering hydrodynamic vertical cross-section -> $(fig_sec_path)...")
+        plot_hydrodynamic_section(
+            active_hydro,
+            variable = :temperature,
+            coordinate = 44.0,
+            section_type = :lat,
+            output_path = fig_sec_path
+        )
+
+        # 8b. Eulerian time series at a representative station. This plot function existed but was
+        # never called by the driver, so no run ever produced an Eulerian time series — the standard
+        # check that a simulation is evolving plausibly at a fixed point.
+        fig_ts_path = joinpath(opts.output_dir, "hydrodynamic_timeseries.png")
         println("Rendering hydrodynamic station time series -> $(fig_ts_path)...")
         try
             plot_hydrodynamic_timeseries(
@@ -960,16 +976,12 @@ function run_segment_visualize(;
         catch err
             @warn "Station time-series plot failed (non-fatal): $(sprint(showerror, err))"
         end
-    else
-        fig_ts_path = nothing
-    end
 
-    # 8c. Additional Eulerian diagnostics. The time series above is now built from the real
-    # snapshots; these three were absent entirely.
-    fig_hov_path = joinpath(opts.output_dir, "hydrodynamic_hovmoller.png")
-    fig_tbot_path = joinpath(opts.output_dir, "bottom_temperature_map.png")
-    fig_ts_diagram_path = joinpath(opts.output_dir, "ts_diagram.png")
-    if !isnothing(active_hydro)
+        # 8c. Additional Eulerian diagnostics. The time series above is now built from the real
+        # snapshots; these three were absent entirely.
+        fig_hov_path = joinpath(opts.output_dir, "hydrodynamic_hovmoller.png")
+        fig_tbot_path = joinpath(opts.output_dir, "bottom_temperature_map.png")
+        fig_ts_diagram_path = joinpath(opts.output_dir, "ts_diagram.png")
         st_lon = opts.domain_lon[1] + 0.55 * (opts.domain_lon[2] - opts.domain_lon[1])
         st_lat = opts.domain_lat[1] + 0.55 * (opts.domain_lat[2] - opts.domain_lat[1])
         for (label, path, f) in (
@@ -980,7 +992,7 @@ function run_segment_visualize(;
              () -> plot_bottom_temperature_map(active_hydro; output_path = fig_tbot_path)),
             ("temperature-salinity diagram", fig_ts_diagram_path,
              () -> plot_temperature_salinity_diagram(active_hydro; output_path = fig_ts_diagram_path))
-        )
+            )
             println("Rendering $label -> $(path)...")
             try
                 f()
@@ -989,11 +1001,8 @@ function run_segment_visualize(;
                 @warn "$label failed (non-fatal): $(first(split(sprint(showerror, err), "\n")))"
             end
         end
-    else
-        fig_hov_path = nothing
-        fig_tbot_path = nothing
-        fig_ts_diagram_path = nothing
     end
+
 
     # 9. Hydrodynamic Field & Dashboard Animation (Oceananigans / CairoMakie)
     anim_file_path = nothing

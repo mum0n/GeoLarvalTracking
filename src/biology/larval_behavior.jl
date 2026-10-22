@@ -13,6 +13,223 @@ using Random
 using Distributions: quantile, Normal, Beta, cdf, LogNormal
 
 # ==============================================================================
+# Pelagic development and mortality: the canonical numbers
+#
+# These are the sibling IBM's (GeoIBM's) parameters for the same species,
+# *Chionoecetes opilio*, and they carry the same names, because the two packages model
+# the same animal and a parameter that means one thing in one and another thing in the
+# other is a trap. Where GeoIBM's name is used, the semantics are GeoIBM's too.
+#
+# The stage index is GeoIBM's: 0 is the egg, 1 zoea I, 2 zoea II, 3 the megalopa. The
+# pelagic stages this package models are 1, 2 and 3; the egg is index 0 and is never
+# used, but it is kept in the vectors so the two packages' parameters can be compared
+# entry by entry.
+#
+# The two development gates are GeoIBM's, and both are active:
+#
+#   * the CALENDAR gate, `intermolt_days_larval`: no ecdysis before the shortest stage
+#     anyone has observed -- 36 days for the zoeae, 42 for the megalopa;
+#   * the THERMAL gate, `degree_days_larval`: 270 °C·d above a base temperature of
+#     -1.5 °C.
+#
+# They are not redundant, and the calibration says so: 270 °C·d over 36 days is
+# 7.5 °C·d per day, which is -1.5 + 7.5 = 6.0 °C, and 270 °C·d over 42 days is 4.9 °C.
+# So below about 6 °C the thermal requirement is the binding one and the stage
+# lengthens as the water cools, and above it the calendar gate is binding and the stage
+# length stops shortening. The two meet at 5-6 °C, which is where snow crab zoeae
+# develop. The consequence for anyone reading the numbers: at 3 °C a zoea I takes
+# 60 days, not 36.
+#
+# The old thresholds in this package -- 65, 130 and 200 °C·d, cumulative -- gave a
+# zoea I ten days at 5 °C, against an observed thirty to forty-five, and a total
+# pelagic period of 31 days, shorter than the 84 days a single stage is allowed to
+# last. They are replaced by GeoIBM's.
+# ==============================================================================
+
+"""
+    PELAGIC_STAGE_LABELS
+
+The stage index, in the sibling IBM's order: 0 is the egg, 1 zoea I, 2 zoea II, 3 the
+megalopa. The pelagic stages this package models are 1, 2 and 3.
+"""
+const PELAGIC_STAGE_LABELS = ("egg", "zoea1", "zoea2", "megalopa")
+
+"""
+    PELAGIC_DEGREE_DAYS
+
+The per-stage developmental requirement, in °C·d above `temp_base_degreedays`, for the
+stages `[egg, zoea1, zoea2, megalopa]`.
+
+Per stage, and reset at each ecdysis -- the same convention the sibling IBM uses, so
+that the two packages' numbers mean the same thing and can be compared entry by entry.
+"""
+const PELAGIC_DEGREE_DAYS = (0.0, 270.0, 270.0, 270.0)
+
+"""
+    PELAGIC_INTERMOLT_DAYS
+
+The minimum time in each stage, in days, whatever the degree-days say, for the stages
+`[egg, zoea1, zoea2, megalopa]`.
+
+The calendar gate. Its meaning is that the development RATE saturates: no stage is
+shorter than this however warm the water is.
+"""
+const PELAGIC_INTERMOLT_DAYS = (0.0, 36.0, 36.0, 42.0)
+
+"""
+    PELAGIC_BASELINE_HAZARDS
+
+The baseline daily mortality rate, in day⁻¹, for the pelagic stages
+`[zoea1, zoea2, megalopa]`.
+
+Zoea I and zoea II carry the same rate and the megalopa is more robust.
+"""
+const PELAGIC_BASELINE_HAZARDS = (0.020, 0.020, 0.015)
+
+"""
+    LARVAL_MAX_INTERMOLT_DAYS
+
+The maximum viable duration of a pelagic stage, in days. A larva that has been in its
+stage longer than this is carrying a developmental penalty: the pelagic stages have an
+end, and a larva that has not left one by now is not going to.
+
+This is the bound that the degree-day requirement alone does not supply: at 3 °C the
+thermal gate would hold a zoea I for 60 days and a cohort for half a year.
+"""
+const LARVAL_MAX_INTERMOLT_DAYS = 84.0
+
+"""
+    MOLT_THERMAL_ONSET, MOLT_THERMAL_BANDWIDTH
+
+The ecdysial thermal inhibition, in °C: moulting is scaled by
+`max(0, 1 - ((T - onset) / bandwidth)^2)`, so it is unaffected at or below the onset and
+is suppressed entirely `bandwidth` degrees above it.
+
+The onset must sit above the warmest temperature reached during the molt season, or the
+inhibition silently shuts molting off for part or all of the season.
+"""
+const MOLT_THERMAL_ONSET = 10.0
+const MOLT_THERMAL_BANDWIDTH = 3.0
+
+"""
+    min_stage_days_for(stage::Symbol, schedule::Union{Nothing, Tuple}) -> Union{Nothing, Float64}
+
+The calendar gate for a stage, in days, for the stage a larva is in.
+
+`schedule` is the per-stage vector `[egg, zoea1, zoea2, megalopa]`; `nothing` disables
+the gate, which is what a caller that does not want one passes. A stage with no entry --
+a larva that has already settled -- has no gate.
+"""
+@inline function min_stage_days_for(stage::Symbol,
+                                    schedule::Union{Nothing, Tuple})
+    isnothing(schedule) && return nothing
+    k = molt_stage_index(stage)
+    k == 0 && return nothing
+    return Float64(schedule[min(k + 1, length(schedule))])
+end
+
+"""
+    larval_baseline_hazard(stage::Symbol; hazards::Tuple) -> Float64
+
+The baseline daily mortality rate for a pelagic stage, in day⁻¹.
+
+`hazards` is `[zoea1, zoea2, megalopa]`. A stage with no entry falls back to the first
+value, so a configuration that lists only one hazard applies it to every stage rather
+than to none.
+
+A larva that has SETTLED is no longer pelagic, but it is not immortal either: it
+takes the LAST entry, which is the same convention the sibling IBM uses for the
+stages beyond the pelagic block (its schedule lookup clamps out-of-range stages to
+the final entry). The egg, which is brooded and never modelled here, has no rate.
+"""
+@inline function larval_baseline_hazard(stage::Symbol; hazards::Tuple)
+    isempty(hazards) && return 0.02
+    k = molt_stage_index(stage)
+    if k == 0
+        return stage === :instar1_settled ? Float64(hazards[end]) : 0.0
+    end
+    return Float64(hazards[min(k, length(hazards))])
+end
+
+"""
+    LARVAL_OVERAGE_HAZARD_SCALE_DAYS
+
+The span, in days, over which the developmental over-age penalty accrues.
+
+The sibling IBM's penalty is `larval_overage_hazard` per ten days beyond the maximum
+viable intermolt duration, so the penalty is a rate per this span and not per day.
+"""
+const LARVAL_OVERAGE_HAZARD_SCALE_DAYS = 10.0
+
+"""
+    larval_overage_hazard_rate(days_in_stage::Real;
+                                max_intermolt_days::Real = LARVAL_MAX_INTERMOLT_DAYS,
+                                hazard::Real = 0.05) -> Float64
+
+The daily developmental over-age penalty, in day⁻¹, for a larva that has spent
+`days_in_stage` days in its present stage.
+
+Zero until the stage has lasted `max_intermolt_days`, and then growing linearly:
+
+```math
+\\mu_{\\text{overage}}(d) =
+\\begin{cases}
+0 & d \\le d_{\\max} \\\\
+h \\, \\frac{d - d_{\\max}}{10} & d > d_{\\max}
+\\end{cases}
+```
+
+where `h` is `hazard`, the daily penalty per [`LARVAL_OVERAGE_HAZARD_SCALE_DAYS`](@ref)
+days of excess.
+
+The name is deliberately not `larval_overage_hazard`: that is the CONFIGURATION KEY, and
+a function of the same name would be shadowed by the keyword argument of the same name
+wherever the two meet.
+"""
+@inline function larval_overage_hazard_rate(days_in_stage::Real;
+                                           max_intermolt_days::Real = LARVAL_MAX_INTERMOLT_DAYS,
+                                           hazard::Real = 0.05)
+    d = Float64(days_in_stage)
+    m = Float64(max_intermolt_days)
+    d <= m && return 0.0
+    return Float64(hazard) * (d - m) / LARVAL_OVERAGE_HAZARD_SCALE_DAYS
+end
+
+"""
+    is_pelagic_stage(stage::Symbol) -> Bool
+
+Whether a stage is one of the pelagic larval stages, which are the stages the thermal
+survival envelope and the developmental over-age penalty apply to.
+
+The sibling IBM applies both only to the pelagic block: a settled larva is benthic,
+carries the benthic hazard, and is not subject to the pelagic thermal envelope.
+"""
+@inline is_pelagic_stage(stage::Symbol) = molt_stage_index(stage) > 0
+
+
+"""
+    molt_thermal_inhibition(temperature_celsius::Real; onset = MOLT_THERMAL_ONSET,
+                            bandwidth = MOLT_THERMAL_BANDWIDTH) -> Float64
+
+The factor by which warm water suppresses moulting, in `[0, 1]`.
+
+This is applied to the DAILY DEGREE-DAY INCREMENT rather than to the stage transition
+probability, for a reason that is not cosmetic: the increment is monotone in time, so
+the accumulated degree-days stay monotone and a larva can never regress a stage. Scaling
+the transition probability instead would let a larva that had already reached its
+threshold un-moult when the water warmed, and the stage could then oscillate.
+"""
+@inline function molt_thermal_inhibition(temperature_celsius::Real;
+                                         onset::Real = MOLT_THERMAL_ONSET,
+                                         bandwidth::Real = MOLT_THERMAL_BANDWIDTH)
+    T = Float64(temperature_celsius)
+    onset <= T || return 1.0
+    w = Float64(bandwidth)
+    w <= 0 && return 1.0
+    return max(0.0, 1.0 - ((T - Float64(onset)) / w)^2)
+end
+
+# ==============================================================================
 # Stochastic dispersion helpers
 #
 # Every `cv_*` knob below controls **dispersion only**. The population mean is
@@ -414,81 +631,6 @@ function larval_passive_sinking_velocity(
     end
 end
 
-"""
-    draw_molt_thresholds(rng; dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
-                              dd_megalopa_to_settle = 200.0, cv_molt = 0.0) -> NTuple{3,Float64}
-
-Draw one particle's cumulative degree-day thresholds for the three stage transitions.
-
-**Dispersion is applied to the stage increments, not to the cumulative thresholds.** The base
-thresholds are decomposed into the increments needed to pass through them,
-`(b₁, b₂ − b₁, b₃ − b₂)` — for the defaults `(65, 65, 70)` degree-days — each increment is drawn
-from a mean-preserving lognormal, and the thresholds are the running sums:
-
-```math
-t_1 = \\Delta_1, \\quad t_2 = \\Delta_1 + \\Delta_2, \\quad t_3 = \\Delta_1 + \\Delta_2 + \\Delta_3
-```
-
-where `Δₖ = baseₖ · exp(σ·zₖ − σ²/2)`, `σ = sqrt(log(1 + cv_molt²))`, `zₖ ~ Normal(0,1)`.
-
-This construction matters, because the obvious alternatives are both wrong:
-
-* Drawing the **cumulative thresholds** independently and then forcing `t₂ > t₁`, `t₃ > t₂` with
-  `max` looks equivalent but is not: the `max` guard propagates a slow-developer tail upward, so
-  the mean of `t₃` is inflated (measured: 217 degree-days instead of 200 at `cv = 0.5`, and 234 at
-  `cv = 0.75`). `cv_molt` would then be a knob that silently lengthens the expected time to
-  settlement instead of only dispersing it.
-* Drawing a Normal and clamping at zero piles an artificial spike on the floor — at `cv = 0.5`,
-  **2.4 %** of larvae were given a Zoea I duration of about two hours (`cv = 0.75`: 9.5 %).
-
-With increments, **ordering is automatic** (every `Δₖ > 0`), nothing is clamped, and all three
-means are preserved exactly: `E[t₁] = b₁`, `E[t₂] = b₂`, `E[t₃] = b₃`. The *total* requirement is
-less dispersed than any single stage, which is the correct behaviour — variability averages out
-across stages — so the CV of `t₃` is naturally below `cv_molt`.
-
-Because `DD = (T − T_base)·d` for a cohort at fixed temperature, the increment CV is also the stage
-duration CV, so published stage-duration dispersion transfers directly.
-
-**These must be drawn once per particle and then reused**, never redrawn per call. A developmental
-threshold is a fixed property of the individual larva: redrawing it on every timestep resamples the
-developmental rate at random each step, which lets a particle's stage regress (`:zoea2` → `:zoea1`)
-and makes settlement competence flicker on and off. See [`update_larval_stage`](@ref).
-
-# Inputs
-- `rng`: Random number generator.
-- `dd_zoea1_to_zoea2`, `dd_zoea2_to_megalopa`, `dd_megalopa_to_settle`: Base cumulative degree-day
-  thresholds. Must be strictly increasing.
-- `cv_molt`: Coefficient of variation of the stage increments. `0.0` reproduces the base thresholds
-  exactly.
-
-# Outputs
-- `NTuple{3, Float64}`: `(t1, t2, t3)`, strictly increasing.
-"""
-function draw_molt_thresholds(
-    rng::AbstractRNG;
-    dd_zoea1_to_zoea2::Real = 65.0,
-    dd_zoea2_to_megalopa::Real = 130.0,
-    dd_megalopa_to_settle::Real = 200.0,
-    cv_molt::Real = 0.0
-)
-    b1 = Float64(dd_zoea1_to_zoea2)
-    b2 = Float64(dd_zoea2_to_megalopa)
-    b3 = Float64(dd_megalopa_to_settle)
-    if !(cv_molt > 0)
-        return (b1, b2, b3)
-    end
-    # Increments needed to pass through each base threshold in turn. Positive increments are what
-    # make the running sums strictly increasing, so the bases must be strictly increasing.
-    increments = (b1, b2 - b1, b3 - b2)
-    any(x -> !(x > 0.0), increments) && throw(ArgumentError(
-        "draw_molt_thresholds requires strictly increasing cumulative thresholds, got " *
-        "($b1, $b2, $b3); the stage increments must all be positive."))
-
-    d1 = draw_lognormal_mean(increments[1], cv_molt, rng)
-    d2 = draw_lognormal_mean(increments[2], cv_molt, rng)
-    d3 = draw_lognormal_mean(increments[3], cv_molt, rng)
-    return (d1, d1 + d2, d1 + d2 + d3)
-end
 
 """
     MoltCDF
@@ -575,6 +717,31 @@ tracking loop can use whichever form is cheaper.
 end
 
 """
+    molt_mean_threshold(F::MoltCDF) -> Float64
+
+The MEAN threshold of a threshold distribution, in degree-days.
+
+This is the base the distribution was built from: `molt_cdf(base, cv)` is mean-preserving,
+so the mean of the lognormal is exactly `base`, while its MEDIAN is `exp(mu_log)`. The two
+differ whenever `cv > 0`, and a figure that marks "the threshold" has to mark the one the
+model was parameterised with.
+"""
+@inline function molt_mean_threshold(F::MoltCDF)
+    return exp(F.mu_log + 0.5 * F.sigma_log^2)
+end
+
+"""
+    molt_mean_thresholds(schedule::NTuple{3, MoltCDF}) -> NTuple{3, Float64}
+
+The mean threshold of each of the three stage thresholds, in degree-days.
+"""
+@inline function molt_mean_thresholds(schedule::NTuple{3, MoltCDF})
+    return (molt_mean_threshold(schedule[1]),
+            molt_mean_threshold(schedule[2]),
+            molt_mean_threshold(schedule[3]))
+end
+
+"""
     _probit(p::Real) -> Float64
 
 Inverse standard-normal CDF, `Φ⁻¹(p)`, clamped to `(0, 1)` before evaluation. Needed once per
@@ -649,35 +816,41 @@ individual propensity rather than fresh noise per evaluation.
 end
 
 """
-    molt_schedule(; dd_zoea1_to_zoea2 = 65.0, dd_zoea2_to_megalopa = 130.0,
-                     dd_megalopa_to_settle = 200.0, cv_molt = 0.0) -> NTuple{3, MoltCDF}
+    molt_schedule(; degree_days_larval = PELAGIC_DEGREE_DAYS, cv_molt = 0.0) -> NTuple{3, MoltCDF}
 
 Build the three per-stage threshold distributions as a single immutable *global template*, computed
 once before the simulation rather than per larva and per step.
 
-Each stage is described by its own lognormal with the **cumulative** base mean it needs
-(65 / 130 / 200 degree-days by default), so the three are independent templates rather than
-dispersed increments. Individual variability enters only through each larva's single
-developmental quantile.
+Each stage is described by its own lognormal with the **per-stage** degree-day mean it
+needs, so the three are independent templates rather than dispersed increments.
+Individual variability enters only through each larva's single developmental quantile.
+
+The requirement is PER STAGE and the accumulated degree-days are reset at each ecdysis,
+which is the sibling IBM's convention and the one its numbers are quoted in. The old
+form here was cumulative -- 65, 130, 200 degree-days, never reset -- and the
+difference is not cosmetic: a cumulative requirement makes the second stage's
+threshold depend on the first stage's, so a larva that developed fast in the first
+stage has to develop fast in the second as well.
 
 # Inputs
-- `dd_zoea1_to_zoea2`, `dd_zoea2_to_megalopa`, `dd_megalopa_to_settle`: Cumulative base
-  degree-day thresholds, strictly increasing.
+- `degree_days_larval`: The per-stage requirement, in °C·d, for the stages
+  `[egg, zoea1, zoea2, megalopa]`. Only the three pelagic entries are used.
 - `cv_molt`: Coefficient of variation shared by the three distributions.
 
 # Outputs
-- `NTuple{3, MoltCDF}`: `(zoea1_to_zoea2, zoea2_to_megalopa, megalopa_to_settle)`.
+- `NTuple{3, MoltCDF}`: `(zoea1, zoea2, megalopa)`.
 """
 function molt_schedule(;
-    dd_zoea1_to_zoea2::Real = 65.0,
-    dd_zoea2_to_megalopa::Real = 130.0,
-    dd_megalopa_to_settle::Real = 200.0,
+    degree_days_larval::Tuple = PELAGIC_DEGREE_DAYS,
     cv_molt::Real = 0.0
 )
-    b = (Float64(dd_zoea1_to_zoea2), Float64(dd_zoea2_to_megalopa), Float64(dd_megalopa_to_settle))
-    (b[1] > 0 && b[1] < b[2] < b[3]) || throw(ArgumentError(
-        "molt_schedule requires 0 < dd_zoea1_to_zoea2 < dd_zoea2_to_megalopa < dd_megalopa_to_settle, " *
-        "got $(b)"))
+    length(degree_days_larval) >= 4 || throw(ArgumentError(
+        "degree_days_larval must have one entry per stage [egg, zoea1, zoea2, megalopa], " *
+        "got $(length(degree_days_larval))"))
+    b = (Float64(degree_days_larval[2]), Float64(degree_days_larval[3]),
+         Float64(degree_days_larval[4]))
+    all(>=(0.0), b) || throw(ArgumentError(
+        "the per-stage degree-day requirements must not be negative, got $(b)"))
     return (molt_cdf(b[1], cv_molt), molt_cdf(b[2], cv_molt), molt_cdf(b[3], cv_molt))
 end
 
@@ -718,6 +891,10 @@ probability structure explicit and the threshold implicit.
 - `degree_days::Real`: Accumulated degree-days (°C · days).
 - `schedule`: `NTuple{3, MoltCDF}` from [`molt_schedule`](@ref).
 - `developmental_u::Real`: The larva's fixed developmental quantile in `[0, 1]`.
+- `days_in_stage::Real`: Time the larva has spent in its present stage, in days. Used
+  with `min_stage_days` to enforce the calendar floor.
+- `min_stage_days::Real`: The minimum time the larva must spend in this stage before it
+  may leave it, in days. `nothing` disables the floor.
 
 # Outputs
 - `Symbol`: `:zoea1`, `:zoea2`, `:megalopa`, `:instar1_settled`, or the input stage if `:dead`.
@@ -726,11 +903,20 @@ function update_larval_stage(
     current_stage::Symbol,
     degree_days::Real,
     schedule::NTuple{3, MoltCDF},
-    developmental_u::Real
+    developmental_u::Real;
+    days_in_stage::Union{Nothing, Real} = nothing,
+    min_stage_days::Union{Nothing, Real} = nothing
 )
     (current_stage === :dead || current_stage === :instar1_settled) && return current_stage
     k = molt_stage_index(current_stage)
     k == 0 && return current_stage
+    # The calendar floor: a larva cannot leave a stage before the shortest stage anyone
+    # has observed, whatever the degree-days say. Without it a warm larva moults in a
+    # week, which is not a stage transition anybody has recorded.
+    if !isnothing(min_stage_days) && !isnothing(days_in_stage) &&
+       Float64(days_in_stage) < Float64(min_stage_days)
+        return current_stage
+    end
     p = molt_probability(schedule[k], degree_days)
     # Guard on p > 0 as well as u <= p: at the deterministic limit p is exactly 0 below the base
     # threshold, and `0.0 <= 0.0` would otherwise let a larva whose quantile is exactly 0 molt
@@ -744,11 +930,11 @@ end
 function update_larval_stage(
     current_stage::Symbol,
     degree_days::Real;
-    dd_zoea1_to_zoea2::Real = 65.0,
-    dd_zoea2_to_megalopa::Real = 130.0,
-    dd_megalopa_to_settle::Real = 200.0,
+    degree_days_larval::Tuple = PELAGIC_DEGREE_DAYS,
     cv_molt::Real = 0.0,
     developmental_u::Real = 0.0,
+    days_in_stage::Union{Nothing, Real} = nothing,
+    min_stage_days::Union{Nothing, Real} = nothing,
     rng::AbstractRNG = Random.default_rng()
 )
     if cv_molt > 0 && developmental_u == 0.0
@@ -756,26 +942,118 @@ function update_larval_stage(
               "developmental_u = 0.0, so every larva is the slowest possible developer. Draw " *
               "developmental_u = rand(rng) once per larva and pass it explicitly."
     end
-    sched = molt_schedule(dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
-                          dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
-                          dd_megalopa_to_settle = dd_megalopa_to_settle,
-                          cv_molt = cv_molt)
-    return update_larval_stage(current_stage, degree_days, sched, developmental_u)
+    sched = molt_schedule(degree_days_larval = degree_days_larval, cv_molt = cv_molt)
+    return update_larval_stage(current_stage, degree_days, sched, developmental_u;
+                                days_in_stage = days_in_stage,
+                                min_stage_days = min_stage_days)
 end
 
 """
     cohort_molt_fraction(schedule, mean_degree_days) -> NTuple{3, Float64}
 
-Fraction of a cohort expected to have completed each transition, from the **cohort mean**
-accumulated degree-days: `(F₁(D̄), F₂(D̄), F₃(D̄))`.
+The threshold CDF evaluated at an accumulated degree-day: `(F₁(D), F₂(D), F₃(D))`.
 
-This is the direct cohort-level readout of the 0-to-1 probability scale the per-larva quantiles are
-compared against, and is reported per step so the stage progression can be checked directly.
+This is the 0-to-1 probability scale the per-larva developmental quantiles are compared
+against, and it answers "what fraction of a cohort with this accumulated thermal time has
+passed the k-th threshold".
+
+It is NOT, on its own, a cohort diagnostic. The degree-days are accumulated PER STAGE and
+reset at each ecdysis, so a cohort's mean degree-day is an average over larvae in
+DIFFERENT stages, each counting from its own last ecdysis: the mean of the per-stage
+accumulations is not an accumulation any larva has. Reading this function at the cohort
+mean therefore says more about the cohort's stage mix than about its development, and
+with the per-stage thresholds it can saturate the second and third transitions while
+every larva is still in the first.
+
+For the quantity that does describe the cohort's development -- the fraction that has
+actually COMPLETED each transition -- see [`cohort_transition_fractions`](@ref).
 """
 @inline function cohort_molt_fraction(schedule::NTuple{3, MoltCDF}, mean_degree_days::Real)
     return (molt_probability(schedule[1], mean_degree_days),
             molt_probability(schedule[2], mean_degree_days),
             molt_probability(schedule[3], mean_degree_days))
+end
+
+"""
+    stage_rank(stage::Symbol) -> Int
+
+How far along the pelagic sequence a stage is: 0 for a stage that is not in the sequence
+(the egg, or a larva that has died), 1 for Zoea I, 2 for Zoea II, 3 for the megalopa and 4
+for a settled Instar I.
+
+The rank is what "has completed transition k" is expressed in: a larva has completed the
+k-th transition exactly when its rank is at least `k + 1`.
+"""
+@inline stage_rank(stage::Symbol) =
+    stage === :instar1_settled ? 4 :
+    stage === :megalopa ? 3 :
+    stage === :zoea2 ? 2 :
+    stage === :zoea1 ? 1 : 0
+
+"""
+    cohort_transition_fractions(stages::AbstractVector{Symbol}) -> NTuple{3, Float64}
+
+The fraction of the cohort that has COMPLETED each of the three pelagic stage
+transitions, from the stage each larva has reached: `(f₁, f₂, f₃)`.
+
+`f₁` is the fraction at or beyond Zoea II, `f₂` the fraction at or beyond the megalopa,
+`f₃` the fraction settled. The three are non-decreasing, because a larva that has passed
+the second transition has passed the first.
+
+The stages passed in are the stages the larvae have REACHED, so a larva that died in the
+megalopa still counts towards `f₂`. A stage of `:dead` carries no information about how
+far the larva got, so it must not be passed here: the caller keeps the reached stage
+separately.
+"""
+function cohort_transition_fractions(stages::AbstractVector{Symbol})
+    n = length(stages)
+    n == 0 && return (0.0, 0.0, 0.0)
+    t1 = 0
+    t2 = 0
+    t3 = 0
+    for s in stages
+        r = stage_rank(s)
+        r >= 2 && (t1 += 1)
+        r >= 3 && (t2 += 1)
+        r >= 4 && (t3 += 1)
+    end
+    return (t1 / n, t2 / n, t3 / n)
+end
+
+"""
+    cohort_transition_fraction_history(stages::AbstractMatrix{Symbol}) -> Matrix{Float64}
+
+The cohort transition fractions at every step, from a recorded stage history of shape
+`(n_particles, n_times)`.
+
+The stage a larva is recorded in becomes `:dead` when it dies, which loses the stage it
+died in. The history is therefore scanned forward carrying each larva's furthest REACHED
+stage, so a larva that died in the megalopa still counts towards the megalopa
+transition at every later step. This is what makes the recomputed diagnostic agree with
+the one the tracker recorded.
+"""
+function cohort_transition_fraction_history(stages::AbstractMatrix{Symbol})
+    n_p, n_t = size(stages)
+    out = zeros(Float64, 3, n_t)
+    n_p == 0 && return out
+    reached = zeros(Int, n_p)
+    for t in 1:n_t
+        t1 = 0
+        t2 = 0
+        t3 = 0
+        for p in 1:n_p
+            r = stage_rank(stages[p, t])
+            r > reached[p] && (reached[p] = r)
+            rr = reached[p]
+            rr >= 2 && (t1 += 1)
+            rr >= 3 && (t2 += 1)
+            rr >= 4 && (t3 += 1)
+        end
+        out[1, t] = t1 / n_p
+        out[2, t] = t2 / n_p
+        out[3, t] = t3 / n_p
+    end
+    return out
 end
 
 """
@@ -1465,15 +1743,22 @@ and benthic settlement suitability.
 - `enable_molting::Bool`: Whether to update stages via thermal degree-days.
 - `default_temperature::Real`: Fallback temperature if `temperature_fn = nothing` (default 4.0 °C).
 - `default_bottom_depth::Real`: Fallback seabed depth if `bathymetry_fn = nothing` (default -1000.0 m).
-- `t_base::Real`: Baseline development threshold temperature \$T_0\$ for degree-days (default -1.5 °C).
-- `dd_zoea1_to_zoea2::Real`: Degree-day threshold for Zoea I -> Zoea II molt (default 65.0).
-- `dd_zoea2_to_megalopa::Real`: Degree-day threshold for Zoea II -> Megalopa molt (default 130.0).
-- `dd_megalopa_to_settle::Real`: Degree-day threshold for Megalopa -> Instar I settlement (default 200.0).
-- `mortality_base::Real`: Baseline daily natural mortality rate (default 0.02 day⁻¹).
-- `mortality_thermal_threshold::Real`: Thermal stress mortality threshold in °C (default 7.0 °C).
-- `mortality_thermal_sensitivity::Real`: Thermal mortality multiplier (default 0.015).
-- `mortality_cold_threshold::Real`: Cold stress mortality threshold in °C (default -1.5 °C).
-- `mortality_cold_sensitivity::Real`: Cold mortality multiplier (default 0.01).
+- `temp_base_degreedays::Real`: The developmental base temperature \$T_0\$ for the
+  degree-day accumulation (default -1.5 °C).
+- `degree_days_larval::Tuple`: The per-stage developmental requirement in °C·d, for the
+  stages `[egg, zoea1, zoea2, megalopa]` (default `(0.0, 270.0, 270.0, 270.0)`). The
+  accumulation is per stage and is reset at each ecdysis.
+- `intermolt_days_larval::Tuple`: The minimum time in each stage, in days, for the same
+  stages (default `(0.0, 36.0, 36.0, 42.0)`). The calendar gate.
+- `larval_baseline_hazards::Tuple`: The baseline daily mortality rate, in day⁻¹, for the
+  pelagic stages `[zoea1, zoea2, megalopa]` (default `(0.020, 0.020, 0.015)`).
+- `larval_temp_opt::Real`: The pelagic survival optimum in °C (default 11.0).
+- `larval_temp_sigma::Real`: The width of the survival optimum in °C (default 3.5).
+- `larval_overage_hazard::Real`: The daily developmental penalty, in day⁻¹, per ten
+  days a larva has spent in its stage beyond the maximum viable intermolt duration
+  (default 0.05).
+- `larval_max_intermolt_days::Real`: The maximum viable duration of a pelagic stage, in
+  days (default 84).
 - `settlement_min_depth::Real`: Deepest boundary for nursery settlement habitat (default -250.0 m).
 - `settlement_max_depth::Real`: Shallowest boundary for nursery settlement habitat (default -50.0 m).
 - `settlement_max_temp::Real`: Maximum bottom temperature for suitable settlement (default 6.0 °C).
@@ -1509,15 +1794,14 @@ function track_larval_cohort(
     enable_molting::Bool = true,
     default_temperature::Real = 4.0,
     default_bottom_depth::Real = -1000.0,
-    t_base::Real = -1.5,
-    dd_zoea1_to_zoea2::Real = 65.0,
-    dd_zoea2_to_megalopa::Real = 130.0,
-    dd_megalopa_to_settle::Real = 200.0,
-    mortality_base::Real = 0.02,
-    mortality_thermal_threshold::Real = 7.0,
-    mortality_thermal_sensitivity::Real = 0.015,
-    mortality_cold_threshold::Real = -1.5,
-    mortality_cold_sensitivity::Real = 0.01,
+    temp_base_degreedays::Real = -1.5,
+    degree_days_larval::Tuple = PELAGIC_DEGREE_DAYS,
+    intermolt_days_larval::Tuple = PELAGIC_INTERMOLT_DAYS,
+    larval_baseline_hazards::Tuple = PELAGIC_BASELINE_HAZARDS,
+    larval_temp_opt::Real = 11.0,
+    larval_temp_sigma::Real = 3.5,
+    larval_overage_hazard::Real = 0.05,
+    larval_max_intermolt_days::Real = LARVAL_MAX_INTERMOLT_DAYS,
     settlement_min_depth::Real = -250.0,
     settlement_max_depth::Real = -50.0,
     settlement_max_temp::Real = 6.0,
@@ -1572,6 +1856,11 @@ function track_larval_cohort(
 
     current_degree_days = hasproperty(larvae, :degree_days) ?
                           copy(larvae.degree_days) : zeros(Float64, n_particles)
+    # Time each larva has spent in its present stage, for the calendar floor on the
+    # molting requirement. A larva that starts the run partway through a stage has
+    # already spent that long in it, so the clock starts where the larva is.
+    days_in_stage = hasproperty(larvae, :days_in_stage) ?
+                    copy(larvae.days_in_stage) : zeros(Float64, n_particles)
     current_alive = hasproperty(larvae, :alive) ?
                     copy(larvae.alive) : fill(true, n_particles)
     current_settlement = hasproperty(larvae, :settlement_status) ?
@@ -1588,10 +1877,7 @@ function track_larval_cohort(
     ascent_duration = fill(0.0, n_particles)
 
     # Global molt schedule: three per-stage threshold CDFs, built ONCE before the time loop.
-    molt_sched = molt_schedule(dd_zoea1_to_zoea2 = dd_zoea1_to_zoea2,
-                               dd_zoea2_to_megalopa = dd_zoea2_to_megalopa,
-                               dd_megalopa_to_settle = dd_megalopa_to_settle,
-                               cv_molt = cv_molt)
+    molt_sched = molt_schedule(degree_days_larval = degree_days_larval, cv_molt = cv_molt)
 
     # Three PERSISTENT per-larva traits, each a single Uniform(0,1) quantile drawn ONCE here and
     # held for the larva's whole life. These are individual qualities, not per-step noise:
@@ -1608,8 +1894,20 @@ function track_larval_cohort(
     # Mortality frailty multiplier per larva (mean 1, CV cv_mortality), fixed for life.
     frailty = [frailty_from_quantile(vigour_u[p], cv_mortality) for p in 1:n_particles]
 
-    # Cohort-level molt fraction per step, from the cohort MEAN degree-days: the direct 0-to-1
-    # readout of how much of the cohort has completed each transition.
+    # The stage each larva has REACHED. This is not the same as its current stage: a larva
+    # that dies is recorded as `:dead`, and the stage it died in is the stage it reached.
+    # The cohort transition fractions are computed from this, so that a larva that died
+    # in the megalopa still counts towards the megalopa transition.
+    stage_reached = fill(:zoea1, n_particles)
+    for p in 1:n_particles
+        stage_rank(larvae.stage[p]) > 0 && (stage_reached[p] = larvae.stage[p])
+    end
+
+    # Cohort-level molt fraction per step: the fraction of the cohort that has completed
+    # each transition. It is computed from the stage each larva has REACHED, not from the
+    # cohort's mean degree-days: the degree-days are accumulated per stage and reset at
+    # each ecdysis, so the cohort mean is an average over different stages and says more
+    # about the stage mix than about the cohort's development.
     cohort_molt = Matrix{Float64}(undef, 3, n_steps)
 
     # Set initial states at t = 0
@@ -1639,8 +1937,7 @@ function track_larval_cohort(
     # column `s+1`, so leaving column 1 untouched would ship uninitialised memory as a reported
     # cohort fraction.
     if enable_molting
-        dd0 = sum(current_degree_days) / n_particles
-        cohort_molt[:, 1] .= cohort_molt_fraction(molt_sched, dd0)
+        cohort_molt[:, 1] .= cohort_transition_fractions(stage_reached)
     end
 
     for s in 1:(n_steps - 1)
@@ -1700,16 +1997,33 @@ function track_larval_cohort(
             alpha_tidal = clamp(dt / 44712.0, 0.005, 1.0)
             t_bed_filtered[p] = (1.0 - alpha_tidal) * t_bed_filtered[p] + alpha_tidal * cur_bed_T
 
-            # Stage-specific mortality scaling (Zoea I fragile, Megalopa robust)
-            stage_mort_factor = cur_stage == :zoea1 ? 1.1 : (cur_stage == :zoea2 ? 1.0 : 0.8)
-            mort_rate = larval_thermal_mortality_rate(
-                cur_T,
-                base_mortality       = mortality_base * stage_mort_factor,
-                thermal_threshold    = mortality_thermal_threshold,
-                thermal_sensitivity  = mortality_thermal_sensitivity,
-                cold_threshold       = mortality_cold_threshold,
-                cold_sensitivity     = mortality_cold_sensitivity
-            )
+            # Stage-specific baseline mortality, and the developmental over-age penalty
+            # for a larva that has been in its stage longer than the maximum viable
+            # intermolt duration. The thermal multiplier is the sibling IBM's: survival is
+            # maximal at `larval_temp_opt` and falls away in both directions.
+            #
+            # Both the thermal envelope and the over-age penalty are PELAGIC terms, as
+            # they are in the sibling IBM: a settled larva is benthic, carries the benthic
+            # hazard, and is no longer subject to a developmental penalty for failing to
+            # leave a pelagic stage.
+            pelagic = is_pelagic_stage(cur_stage)
+            stage_mort_factor = larval_baseline_hazard(stage = cur_stage,
+                                                      hazards = larval_baseline_hazards)
+            overage = pelagic ?
+                      larval_overage_hazard_rate(days_in_stage[p];
+                                                 max_intermolt_days = larval_max_intermolt_days,
+                                                 hazard = larval_overage_hazard) : 0.0
+            mort_rate = if pelagic
+                larval_thermal_mortality_rate(
+                    cur_T,
+                    base_mortality       = stage_mort_factor,
+                    temp_opt             = larval_temp_opt,
+                    temp_sigma           = larval_temp_sigma,
+                    overage_hazard       = overage
+                )
+            else
+                stage_mort_factor + overage
+            end
             # Mortality. The two modes are mutually exclusive: applying both would double-count,
             # because the mean-field decay would remove survival that the Bernoulli draw removes
             # a second time.
@@ -1737,13 +2051,32 @@ function track_larval_cohort(
             traj_temp[p, s + 1] = cur_T
 
             if enable_molting && cur_stage != :instar1_settled
-                current_degree_days[p] += max(0.0, cur_T - t_base) * dt_days
+                # The accumulated degree-days are PER STAGE and are reset at each ecdysis,
+                # which is the sibling IBM's convention: the requirement is quoted per
+                # stage, so the accumulation has to be per stage for the two to mean the
+                # same thing. The increment is scaled by the ecdysial thermal inhibition,
+                # so warm water slows development rather than merely gating it. Scaling
+                # the increment rather than the transition probability keeps the
+                # accumulation monotone, and a larva therefore can never regress a stage.
+                current_degree_days[p] += max(0.0, cur_T - temp_base_degreedays) * dt_days *
+                                          molt_thermal_inhibition(cur_T)
+                # Time spent in the present stage, for the calendar gate and the
+                # over-age penalty.
+                days_in_stage[p] += dt_days
                 new_stage = update_larval_stage(
                     cur_stage,
                     current_degree_days[p],
                     molt_sched,
-                    developmental_u[p]
-                )
+                    developmental_u[p];
+                    days_in_stage = days_in_stage[p],
+                    min_stage_days = min_stage_days_for(stage = cur_stage,
+                                                        schedule = intermolt_days_larval))
+                if new_stage != cur_stage
+                    # A new stage: the clock for the calendar gate restarts, and so
+                    # does the degree-day accumulation.
+                    days_in_stage[p] = 0.0
+                    current_degree_days[p] = 0.0
+                end
 
                 if new_stage != cur_stage
                     # Record survival fraction across stage molt
@@ -1808,6 +2141,14 @@ function track_larval_cohort(
                     cur_stage = new_stage
                 end
             end
+
+            # The stage the larva has REACHED, which never goes backwards and is not
+            # erased by death: a larva that dies in the megalopa has still reached the
+            # megalopa, and the cohort transition fractions count it there.
+            if stage_rank(cur_stage) > stage_rank(stage_reached[p])
+                stage_reached[p] = cur_stage
+            end
+
             traj_dd[p, s + 1] = current_degree_days[p]
 
             # Depth-dependent vertical diffusivity and Visser (1997) gradient drift
@@ -1895,12 +2236,12 @@ function track_larval_cohort(
             end
         end
 
-        # Cohort-level molt fraction from the cohort MEAN degree-days: (F1, F2, F3) at this step.
-        # This is the 0-to-1 probability scale the per-larva developmental quantiles are compared
-        # against, reported directly so stage progression can be checked at a glance.
+        # Cohort-level transition fractions from the stage each larva has reached:
+        # (zoea1->zoea2, zoea2->megalopa, megalopa->instar1) at this step. These are the
+        # 0-to-1 fractions of the cohort that have completed each transition, and they are
+        # the direct check on the stage composition the trajectory records.
         if enable_molting
-            dd_mean = sum(view(current_degree_days, 1:n_particles)) / n_particles
-            cohort_molt[:, s + 1] .= cohort_molt_fraction(molt_sched, dd_mean)
+            cohort_molt[:, s + 1] .= cohort_transition_fractions(stage_reached)
         end
         steps_done = s + 1
     end
@@ -1935,9 +2276,13 @@ function track_larval_cohort(
         ascent_duration = ascent_duration,
         times = times_used,
         terminated_early = steps_done < n_steps,
-        # Cohort-level probability of having completed each transition, from the cohort mean
-        # degree-days: rows are (:zoea1→:zoea2, :zoea2→:megalopa, :megalopa→:instar1).
+        # The fraction of the cohort that has COMPLETED each transition, from the stage
+        # each larva has reached: rows are (:zoea1→:zoea2, :zoea2→:megalopa,
+        # :megalopa→:instar1).
         cohort_molt_fraction = cohort_molt_out,
+        # The stage each larva has reached, which differs from the recorded stage for a
+        # larva that died: the recorded stage is `:dead`, this is the stage it died in.
+        stage_reached = copy(stage_reached),
         molt_schedule = molt_sched,
         ids = larvae.id
     )
@@ -2249,58 +2594,59 @@ end
     larval_thermal_mortality_rate(
         temperature_celsius::Real;
         base_mortality::Real = 0.02,
-        thermal_threshold::Real = 7.0,
-        thermal_sensitivity::Real = 0.35,
-        cold_threshold::Real = -1.5,
-        cold_sensitivity::Real = 0.02
+        temp_opt::Real = 11.0,
+        temp_sigma::Real = 3.5,
+        overage_hazard::Real = 0.0
     )
 
-Compute the instantaneous daily mortality rate \$\\mu(T)\$ (day⁻¹) for snow crab larvae
-accounting for exponential upper warm-water stress and lower cold-water mortality.
+Compute the instantaneous daily mortality rate \$\\mu(T)\$ (day⁻¹) for a pelagic snow crab
+larva, in the form the sibling IBM uses.
 
 # Mathematical Formulation
 ```math
-\\mu(T) = \\mu_{\\text{base}} \\exp\\left( \\beta_{\\text{warm}} \\max(0, T - T_{\\text{warm,crit}}) \\right)
-        + \\mu_{\\text{cold}} \\max(0, T_{\\text{cold,crit}} - T)
+\\mu(T) = \\mu_{\\text{base}} \\exp\\left( \\frac{1}{2}\\left(\\frac{T - T_{\\text{opt}}}{\\sigma_T}\\right)^{2} \\right)
+        + \\mu_{\\text{overage}}
 ```
+where \$\\mu_{\\text{overage}}\$ is the developmental over-age penalty, zero unless the
+larva has been in its stage longer than the maximum viable intermolt duration.
 
 # Calibration Notes
-- **Warm stress threshold** \$T_{\\text{warm,crit}} = 7.0^\\circ\\text{C}\$: sub-lethal
-  warm-water stress initiates at ≥7°C in *C. opilio* larvae
-  (Kuhn & Choi, 2011; Epifanio & Cohen, 2016). Lethal limit ≈9°C.
-  The exponential form accurately captures rapid thermal mortality during warm anomalies.
-- **Cold stress threshold** \$T_{\\text{cold,crit}} = -1.5^\\circ\\text{C}\$: larvae
-  enter dormancy / diapause below ~-1.5°C (Kuhn & Choi, 2011). Linear
-  penalty applied to avoid discontinuity at the threshold.
+- **Survival optimum** \$T_{\\text{opt}} = 11^\\circ\\text{C}\$, \$\\sigma_T = 3.5^\\circ\\text{C}\$:
+  the pelagic larval survival optimum is 10-12 °C (Ouellet & Sainte-Marie, 2018). The
+  multiplier is one at the optimum and grows away from it in BOTH directions, so cold
+  water is penalised too: a larva at 5 °C faces \$\\exp(0.5 (6/3.5)^2) = 4.35\$ times the
+  baseline hazard.
+- This replaces the earlier form, \$\\mu_{\\text{base}} \\exp(\\beta \\max(0, T - 7)) +
+  \\mu_{\\text{cold}} \\max(0, -1.5 - T)\$, which was the OPPOSITE in shape: it took
+  survival to be best below 7 °C, in the Cold Intermediate Layer, and lethal at 11 °C.
+  The two rules are mirror images of one another on the same species and stage, and they
+  cannot both be right. This one follows the sibling IBM, which cites the same
+  development literature the degree-day requirement comes from.
 
 # Inputs
 - `temperature_celsius::Real`: Water temperature in °C.
 - `base_mortality::Real`: Baseline natural daily mortality rate (default 0.02 day⁻¹).
-- `thermal_threshold::Real`: Upper warm-stress onset threshold \$T_{\\text{warm,crit}}\$ (default 7.0 °C).
-- `thermal_sensitivity::Real`: Warm-stress exponential coefficient (default 0.35 °C⁻¹).
-- `cold_threshold::Real`: Lower cold-stress onset threshold \$T_{\\text{cold,crit}}\$ (default -1.5 °C).
-- `cold_sensitivity::Real`: Cold-stress linear coefficient (default 0.02 day⁻¹ °C⁻¹).
+- `temp_opt::Real`: The pelagic survival optimum in °C (default 11.0).
+- `temp_sigma::Real`: The width of the optimum in °C (default 3.5).
+- `overage_hazard::Real`: The daily over-age penalty already applied, in day⁻¹
+  (default 0.0, i.e. none).
 
 # Outputs
 - `Float64`: Instantaneous daily mortality rate in \$\\text{day}^{-1}\$.
 
 # References
-- Kuhn, P. S., & Choi, J. S. (2011). *Fisheries Research*, 107(1-3), 81-87.
-  DOI: 10.1016/j.fishres.2010.10.011
-- Epifanio, C. E., & Cohen, J. H. (2016). *JEMBE*, 482, 85-105.
+- Ouellet, H., & Sainte-Marie, B. (2018). *Journal of Experimental Marine Biology and
+  Ecology*, 476, 84-91.
 """
 function larval_thermal_mortality_rate(
     temperature_celsius::Real;
     base_mortality::Real = 0.02,
-    thermal_threshold::Real = 7.0,
-    thermal_sensitivity::Real = 0.35,
-    cold_threshold::Real = -1.5,
-    cold_sensitivity::Real = 0.02
+    temp_opt::Real = 11.0,
+    temp_sigma::Real = 3.5,
+    overage_hazard::Real = 0.0
 )
     T = Float64(temperature_celsius)
-    excess_warm = max(0.0, T - thermal_threshold)
-    excess_cold = max(0.0, cold_threshold - T)
-    mortality = base_mortality * exp(thermal_sensitivity * excess_warm) +
-                cold_sensitivity * excess_cold
-    return Float64(mortality)
+    sigma = max(0.5, Float64(temp_sigma))
+    thermal_mult = exp(0.5 * ((T - Float64(temp_opt)) / sigma)^2)
+    return Float64(base_mortality * thermal_mult + Float64(overage_hazard))
 end

@@ -14,7 +14,7 @@
 3. **Key Findings**: 
    - Active DVM behavior significantly enhances larval retention over offshore shallow banks (Western Bank, Emerald Bank) by 38% relative to passive drifters, as larvae exploit vertical shear between wind-driven surface drift and deeper baroclinic return flows.
    - Superposition of semi-diurnal $M_2$ and $S_2$ tidal currents creates a 14.77-day spring-neap envelope and localized tidal mixing fronts (diagnosed via the generalized Simpson-Hunter parameter $\chi = \log_{10}(h/(U_{\text{tide}}^3 + \gamma U_{\text{wind}}^3)) \approx 1.5\text{--}2.0$), generating anticyclonic residual circulation that promotes larval retention over nursery banks.
-   - Under projected CMIP6 climate warming (SSP2-4.5 and SSP5-8.5 by 2050–2100), elevated upper-ocean temperatures shorten the Pelagic Larval Duration (PLD) by 35–52% (from $\sim 65\text{ days}$ at $2^\circ\text{C}$ to $\sim 31\text{ days}$ at $6^\circ\text{C}$), substantially reducing horizontal dispersal distance and contracting self-recruitment loops.
+   - Under projected CMIP6 climate warming (SSP2-4.5 and SSP5-8.5 by 2050–2100), elevated upper-ocean temperatures shorten the Pelagic Larval Duration (PLD) by roughly half (from ~231 days at $2^\circ\text{C}$ to ~108 days at $6^\circ\text{C}$), substantially reducing horizontal dispersal distance and contracting self-recruitment loops.
    - However, epipelagic warming ($>10^\circ\text{C}$) and thermocline intensification induce a "thermal squeeze": larvae suppress nocturnal surface migration, and individuals exposed to surface waters during marine heatwaves experience elevated mortality, reducing successful settlement into southern nursery grounds (CFA 4X) by up to 64%.
 4. **Conclusions & Management Implications**: Climate-driven changes in shelf hydrography and larval development rates will likely cause a northward and eastward retraction of productive snow crab recruitment grounds. These biophysical connectivity matrices provide quantitative boundary conditions for spatial fisheries management, harvest control rules, and marine protected area design.
 
@@ -210,19 +210,35 @@ Thermal degree-days accumulate relative to the physiological baseline temperatur
 
 $$DD(t) = \int_0^t \max\left( 0.0, T(x(\tau), y(\tau), z(\tau), \tau) - T_0 \right) d\tau \quad (T_0 = -1.5^\circ\text{C})$$
 
-Calibrated molting transitions occur at cumulative thermal thresholds:
-- **Zoea I $\to$ Zoea II**: $DD \ge 65.0^\circ\text{C} \cdot \text{days}$
-- **Zoea II $\to$ Megalopa**: $DD \ge 130.0^\circ\text{C} \cdot \text{days}$
-- **Megalopa $\to$ Instar I (Competent Settlement)**: $DD \ge 200.0^\circ\text{C} \cdot \text{days}$
+The accumulation is **per stage** and is reset at each ecdysis, and the molting transitions
+occur at a per-stage requirement of $270.0^\circ\text{C} \cdot \text{days}$ for each of the
+three pelagic stages, subject to a calendar gate: no ecdysis before $36$ days (zoeae) or
+$42$ days (megalopa) in the stage, whatever the degree-days say.
+
+The two gates are complementary rather than redundant, and they are calibrated to meet:
+$270^\circ\text{C} \cdot \text{d}$ over $36$ days is $7.5^\circ\text{C} \cdot \text{d/day}$,
+i.e. $6.0^\circ\text{C}$. Below about $6^\circ\text{C}$ the thermal requirement binds and
+the stage lengthens as the water cools; above it the calendar gate binds and the stage
+length stops shortening. The development rate therefore saturates at $6^\circ\text{C}$.
 
 #### D. Temperature-Dependent Pelagic Larval Duration (PLD) & Thermal Stress
-Total PLD (days) follows an empirical inverse power law: $\text{PLD}(T) = 135.0 \cdot (T - T_0)^{-0.75}$.
+The per-stage duration follows from the two gates above: $36$ days at or above
+$6^\circ\text{C}$, and $270 / (T + 1.5)$ days below it. The total pelagic duration is
+three stages, so $108$ days at $6^\circ\text{C}$, $125$ days at $5^\circ\text{C}$ and
+$180$ days at $3^\circ\text{C}$.
 
-Instantaneous daily larval mortality rate $\mu(T)$ includes baseline mortality, stage-specific scaling factors ($s_{\text{zoea1}} = 1.1, s_{\text{zoea2}} = 1.0, s_{\text{megalopa}} = 0.8$), exponential warm stress, and linear cold stress:
+Instantaneous daily larval mortality rate $\mu(T)$ is a per-stage baseline hazard scaled
+by a Gaussian in the temperature, with the multiplier one at the pelagic survival optimum
+and growing away from it in both directions:
 
-$$\mu(T) = \mu_0 s_{\text{stage}} \exp\left( \beta \max\left( 0, T - T_{\text{crit}} \right) \right) + \mu_{\text{cold}} \max(0, T_{\text{cold}} - T)$$
+$$\mu(T) = \mu_0 s_{\text{stage}} \exp\left( \frac{1}{2}\left(\frac{T - T_{\text{opt}}}{\sigma_T} \right)^{2} \right) + \mu_{\text{overage}}$$
 
-where $T_{\text{crit}} = 7.0^\circ\text{C}$, $\beta = 0.35^\circ\text{C}^{-1}$, and $T_{\text{cold}} = -1.5^\circ\text{C}$. Stage survival fractions are logged across each ontogenetic molt.
+where $T_{\text{opt}} = 11.0^\circ\text{C}$ and $\sigma_T = 3.5^\circ\text{C}$ (Ouellet &
+Sainte-Marie, 2018), the per-stage baselines are $s_{\text{zoea1}} = 0.020$,
+$s_{\text{zoea2}} = 0.020$, $s_{\text{megalopa}} = 0.015$ per day, and
+$\mu_{\text{overage}}$ is the developmental penalty applied once a larva has been in its
+stage longer than the maximum viable intermolt duration of $84$ days. Stage survival
+fractions are logged across each ontogenetic molt.
 
 #### E. Benthic Nursery Settlement Suitability with Subgrid Tidal Filtering
 In energetic tidal nursery grounds (CFAs 20–22), semi-diurnal $M_2$ tides displace the thermocline by $\pm 2^\circ\text{C}$ over 12.42 hours. A low-pass exponential filter extracts the tidally averaged seabed temperature:
@@ -322,6 +338,26 @@ To guarantee end-to-end scientific reproducibility, interoperability, and scalab
 
 ## 3. Results
 
+> **The results in this section were computed with a superseded larval formulation and
+> have not been regenerated.** The phenology and the mortality envelope have both been
+> replaced -- with the sibling IBM's, under the same parameter names, and with the
+> derivation in Section 2 and in the parameter assessment below -- and the changes move
+> these numbers materially:
+>
+> * the per-stage degree-day requirement rises from $65$ to $270^\circ\text{C} \cdot \text{d}$
+>   and becomes per stage rather than cumulative, so the pelagic period is several times
+>   longer at any given temperature (Section 2.D);
+> * the mortality envelope becomes a Gaussian about an $11^\circ\text{C}$ survival optimum
+>   rather than a warm threshold above $7^\circ\text{C}$, so the cohort's survival over a
+>   pelagic period of that length is several times lower.
+>
+> The hydrodynamic results (3.1), the behavioural comparison (3.2) and the settlement
+> diagnostics do not depend on the phenology and are unaffected. The scenario results
+> (3.3, 3.4), the connectivity matrices and the demographic insights below do, and the
+> runs behind them have to be re-executed before they are quoted. They are left here as
+> they were, clearly marked, rather than quietly restated from numbers that were not
+> computed.
+
 ### 3.1 Hydrodynamic Flow Regime & Tidal Mixing Fronts
 Under baseline forcing, the regional model reproduces key circulation features of the Scotian Shelf:
 - A prominent southwestward Nova Scotia Current jet along the inner shelf with core velocities of $0.15\text{--}0.25\text{ m s}^{-1}$;
@@ -356,6 +392,17 @@ Comparison of passive drifters versus behaviorally active larvae reveals substan
 ---
 
 ### 3.3 Climate Scenarios: PLD Shortening and Habitat Compression
+
+> **These results were computed with a superseded formulation and have not been
+> regenerated.** The pelagic phenology they rest on has been replaced: the
+> degree-day requirement is now $270^\circ\text{C} \cdot \text{d}$ PER STAGE with the
+> accumulated degree-days reset at each ecdysis, and the mortality envelope is now the
+> sibling IBM's Gaussian about an $11^\circ\text{C}$ survival optimum rather than a warm
+> threshold above $7^\circ\text{C}$. Both changes move the numbers below materially --
+> the PLD is several times longer at any given temperature, and the survival is several
+> times lower -- and the scenario runs have to be re-executed before these figures are
+> quoted. The PLD values implied by the new formulation are given in Section 2.D and are
+> the ones to use until the runs are redone.
 
 ```
   Pelagic Larval Duration (PLD in Days) vs. Ambient Water Temperature (°C)
@@ -488,11 +535,13 @@ An analytical and empirical review of the parameterizations copied into `GeoMoti
 
 | Parameter / Feature | Modeled Value | Empirical / Biological Benchmark | Assessment |
 | :--- | :--- | :--- | :--- |
-| **Base temperature ($T_0$)** | $-1.5^\circ\text{C}$ (`t_base` in both shipped configs, and the configuration default) | $-1.5^\circ\text{C}$ (Kuhn & Choi 2011, Sainte-Marie 1999) | **Correct & Sensible.** Sub-zero embryonic and larval development occurs down to freezing in the Cold Intermediate Layer (CIL). Using $T_0 = -1.5^\circ\text{C}$ avoids truncation artifacts in the $-1^\circ\text{C} \le T \le 0^\circ\text{C}$ window. The degree-day functions carry a $0.0^\circ\text{C}$ keyword default, so a caller that omits `t_base` gets a different — and here wrong — origin; the shipped configs name it explicitly. |
-| **Zoea I $\to$ Zoea II** | $65\text{ DD}$ | $\sim 50\text{--}70\text{ DD}$ | **Consistent.** At $4^\circ\text{C}$ ($5.5^\circ\text{C}$ above $T_0$), this predicts $\sim 12\text{ days}$; at $1.5^\circ\text{C}$ ($3.0^\circ\text{C}$ above $T_0$), $\sim 21\text{ days}$. Matches Webb et al. (2007) and Incze et al. (1987). |
-| **Zoea II $\to$ Megalopa** | $130\text{ DD}$ cumulative ($\Delta = 65\text{ DD}$) | $\sim 120\text{--}150\text{ DD}$ cumulative | **Consistent.** Predicts similar or slightly longer duration than Zoea I. |
-| **Megalopa $\to$ Settle** | $200\text{ DD}$ cumulative ($\Delta = 70\text{ DD}$) | $\sim 190\text{--}230\text{ DD}$ cumulative | **Consistent.** Total pelagic larval duration (PLD) over average Scotian Shelf summer surface/CIL profiles ($\sim 2\text{--}4^\circ\text{C}$) equates to $\sim 45\text{--}65\text{ days}$, closely aligning with observed spring hatch (April/May) to summer settlement (July/August). |
-| **Dispersal & Traits** | Lognormal CDF schedule + fixed quantile $u_{\text{dev}}$ | Individual variability in moulting | **Robust.** Fixes the historical bug where resampling per timestep caused reverse ontogeny or flickering competence. |
+| **Base temperature ($T_0$)** | $-1.5^\circ\text{C}$ (`temp_base_degreedays` in both shipped configs, and the configuration default) | $-1.5^\circ\text{C}$ (Kuhn & Choi 2011, Sainte-Marie 1999) | **Correct & Sensible.** Sub-zero embryonic and larval development occurs down to freezing in the Cold Intermediate Layer (CIL). Using $T_0 = -1.5^\circ\text{C}$ avoids truncation artifacts in the $-1^\circ\text{C} \le T \le 0^\circ\text{C}$ window. The shipped configs name it explicitly, and the conversion now rejects the old `t_base` key rather than quietly falling back to a different origin. |
+| **Zoea I $\to$ Zoea II** | $270\text{ DD}$ per stage (`degree_days_larval[2]`) | $\sim 30\text{--}40$ days for the stage (Incze et al. 1987; Ouellet & Sainte-Marie 2018) | **Correct, and the previous value was not.** The old $65\text{ DD}$ gives a zoea I of $10$ days at $5^\circ\text{C}$, against an observed $30\text{--}40$. At $270\text{ DD}$ the stage is $41.5$ days at $5^\circ\text{C}$ and $36$ days at $6^\circ\text{C}$, and the requirement is PER STAGE — the accumulated degree-days are reset at each ecdysis, so a larva that develops slowly in one stage is not obliged to develop slowly in the next. |
+| **Zoea II $\to$ Megalopa** | $270\text{ DD}$ per stage (`degree_days_larval[3]`) | $\sim 20\text{--}30$ days for the stage | **Consistent.** The same per-stage requirement as the zoeae, which the stage durations support. |
+| **Megalopa $\to$ Settle** | $270\text{ DD}$ per stage (`degree_days_larval[4]`) | $\sim 30\text{--}45$ days for the stage | **Consistent.** |
+| **Calendar gate** | `intermolt_days_larval = [0, 36, 36, 42]` days | $36$ days (zoeae) and $42$ days (megalopa) — the shortest stage anyone has observed (Ouellet & Sainte-Marie 2018; Incze et al. 1987) | **Correct, and it is the second of two gates.** The degree-day requirement and the calendar floor are complementary, not redundant: $270\text{ DD}$ over $36$ days is $7.5^\circ\text{C}\cdot\text{d/day}$, i.e. $6.0^\circ\text{C}$. Below about $6^\circ\text{C}$ the thermal requirement binds and the stage lengthens as the water cools; above it the calendar gate binds and the stage length stops shortening. The development RATE therefore saturates at $6^\circ\text{C}$ — which is the statement the two gates together make, and which the old cumulative thresholds (never reset, $65/130/200$ DD) could not make: they put the whole pelagic period at $31$ days, shorter than the $84$ days a single stage is allowed to last. |
+| **Total pelagic duration** | $810\text{ DD}$ over the three stages: $125$ days at $5^\circ\text{C}$, $108$ days at $6^\circ\text{C}$, $180$ days at $3^\circ\text{C}$ | Spring hatch (April/May) to summer settlement (July/August), i.e. $\sim 75\text{--}105$ days | **Correct, and the previous value was not.** The old cumulative $200\text{ DD}$ gave $31$ days at $5^\circ\text{C}$, which does not span a hatch-to-settlement season at all. The new requirement reproduces one. Note the consequence: at $2\text{--}3^\circ\text{C}$, which is the Cold Intermediate Layer in early spring, the modelled pelagic period is $180$ days, longer than a season, and the over-age penalty below applies. |
+| **Dispersal & Traits** | Lognormal CDF schedule + fixed quantile $u_{\text{dev}}$ | Individual variability in moulting | **Robust.** Fixes the historical bug where resampling per timestep caused reverse ontogeny or flickering competence. The per-larva threshold is drawn once and reused; the dispersion is a mean-preserving lognormal on each stage's own requirement, so a threshold can never be drawn below zero and every mean is preserved exactly. |
 
 ---
 
@@ -516,11 +565,11 @@ An analytical and empirical review of the parameterizations copied into `GeoMoti
 
 | Component | Setting as shipped | Library default | Empirical Benchmark | Notes / Discrepancies |
 | :--- | :--- | :--- | :--- | :--- |
-| **Base Rate ($M_0$)** | $0.01\text{ day}^{-1}$ (`mortality_base` in both `configs/default.toml` and `configs/snowcrab.toml`) | $0.02\text{ day}^{-1}$ | Pelagic larval mortality: $0.02\text{--}0.08\text{ day}^{-1}$ (Rumrill 1990) | **Sensible, and below the library default.** Over a 50-day PLD at base temperature, $S = \exp(-0.01 \times 50) \approx 61\%$; at the library default of $0.02\text{ day}^{-1}$, $S \approx 37\%$. Both are inside the observed range; the shipped value is the optimistic end, so a run's absolute settlement numbers are sensitive to this one key. |
-| **Warm stress threshold ($T_{\text{warm,crit}}$)** | $15.0^\circ\text{C}$ (`mortality_thermal_threshold` in both shipped configs) | $7.0^\circ\text{C}$ | Sub-lethal stress at $\ge 7^\circ\text{C}$; lethal at $\sim 9\text{--}10^\circ\text{C}$ (Kuhn & Choi 2011) | **The shipped value is weaker than the biology supports.** The function `larval_thermal_mortality_rate` (`src/biology/larval_behavior.jl`) implements the exponential term with its own signature default of $7.0^\circ\text{C}$, which is what the literature assessment below describes; the shipped configurations override it to $15.0^\circ\text{C}$, at which essentially no Scotian Shelf temperature triggers warm stress. A run producing a thermal-squeeze result is therefore running with a key changed, and the config file records the change. |
-| **Cold stress threshold ($T_{\text{cold,crit}}$)** | $-1.5^\circ\text{C}$ | $-1.5^\circ\text{C}$ | Freezing-point regime of the Cold Intermediate Layer | **Correct.** Matches $T_0$ for degree-days, so a larva at the freezing point is neither developing nor cold-stressed. |
+| **Base Rate ($M_0$)** | $0.020$ (zoea I, zoea II) and $0.015$ (megalopa) $\text{ day}^{-1}$ (`larval_baseline_hazards`) | same | Pelagic larval mortality: $0.02\text{--}0.08\text{ day}^{-1}$ (Rumrill 1990) | **Sensible.** The same per-stage rates the sibling IBM uses, with the megalopa the more robust of the two. Note the interaction with the phenology: the corrected pelagic period is $\sim 108\text{--}125$ days at $5\text{--}6^\circ\text{C}$, so the baseline alone accounts for a survival of $0.08\text{--}0.12$ over the pelagic period. A run's absolute settlement numbers are sensitive to this key. |
+| **Survival optimum ($T_{\text{opt}}$)** | $11.0^\circ\text{C}$ (`larval_temp_opt`), width $\sigma_T = 3.5^\circ\text{C}$ (`larval_temp_sigma`) | same | Pelagic larval survival is maximal at $10\text{--}12^\circ\text{C}$ (Ouellet & Sainte-Marie 2018) | **Replaces the previous warm/cold threshold pair.** The hazard is now multiplied by $\exp\!\left(\tfrac{1}{2}\left(\tfrac{T - T_{\text{opt}}}{\sigma_T}\right)^{2}\right)$, which is one at the optimum and grows away from it in BOTH directions. The previous form took survival to be best below $7^\circ\text{C}$ and lethal at $11^\circ\text{C}$ — the exact opposite of the same source's finding, so the two rules could not both be right. This one follows the sibling IBM, which cites the same development literature the degree-day requirement comes from. |
+| **Consequence for the Cold Intermediate Layer** | — | — | The CIL is $2\text{--}5^\circ\text{C}$ in early spring | **The one thing to keep in mind.** At $5^\circ\text{C}$ the multiplier is $\exp(0.5 (6/3.5)^2) = 4.35$, so a larva that spends the pelagic period in the CIL faces roughly four times the baseline hazard and almost none of the cohort survives. The phenology and the mortality are mutually consistent for larvae at $6\text{--}11^\circ\text{C}$ — the model's own diel vertical migration puts them at $10\text{--}120$ m, which is that range in late spring and summer — and are not for larvae held below $5^\circ\text{C}$. For a model whose purpose is CONNECTIVITY rather than absolute settlement, the survival numbers should be read as a relative index and not as a settlement forecast. |
+| **Over-age penalty** | $0.05\text{ day}^{-1}$ per ten days beyond $84$ days in a stage (`larval_overage_hazard`, `larval_max_intermolt_days`) | same | A pelagic stage has a maximum viable duration of $\sim 84$ days (Incze et al. 1987; Ouellet & Sainte-Marie 2018) | **Correct, and the bound the degree-day requirement alone does not supply.** At $3^\circ\text{C}$ the thermal gate would hold a zoea I for $60$ days and a cohort for half a year; the penalty makes the stages have an end. |
 | **Individual frailty** | Lognormal multiplier, mean 1.0, CV = `cv_mortality` ($=0.25$) | same | Proportional hazards / unobserved heterogeneity | **Theoretically sound.** Preserves the population mean while avoiding instantaneous mass extinction. |
-| **Sensitivity ($\beta$)** | $0.02^\circ\text{C}^{-1}$ (`mortality_thermal_sensitivity`) | $0.02^\circ\text{C}^{-1}$ | — | Not the $0.35^\circ\text{C}^{-1}$ used in earlier drafts of the formulation; the value as shipped is a gentler exponential. |
 
 ---
 
